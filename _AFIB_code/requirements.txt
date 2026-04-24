@@ -1,0 +1,11 @@
+numpy
+scipy
+scikit-learn
+joblib
+pandas
+tabulate
+tqdm
+scikit-multilearn
+torch
+tensorboard
+pyyaml

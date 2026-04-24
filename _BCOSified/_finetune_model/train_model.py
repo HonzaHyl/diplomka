@@ -1,0 +1,47 @@
+import sys
+from main_code import training_code
+import mlflow
+import datetime
+import os
+
+if __name__ == '__main__':
+    #################### MlFlow Setup ####################
+    db_url = "sqlite:////mnt/mdpm/d03/jhyl/deepstem_results/mlflow_runs.db"
+    experiment_name = "BCOSified_finetuning"
+    artifact_path = "file:///mnt/mdpm/d03/jhyl/Afib_recurrence/diplomka/results/mlruns"
+
+    mlflow.set_tracking_uri(db_url)
+
+    try:
+        mlflow.create_experiment(experiment_name, artifact_location=artifact_path)
+    except mlflow.exceptions.MlflowException:
+        pass # Experiment already exists
+    mlflow.set_experiment(experiment_name)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"Training_{timestamp}"
+    run_dir = os.path.join("/srv/home/jhyl/Afib_recurrence/diplomka/results", run_name)
+    os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
+    os.makedirs(os.path.join(run_dir, "model"), exist_ok=True)
+    print(f"[INFO] Run directory created: {run_dir}")
+    mlflow.start_run(run_name=run_name)
+
+    print(f"[INFO] MLflow tracking URI: {mlflow.get_tracking_uri()}")
+    print(f"[INFO] Experiment ID: {mlflow.get_experiment_by_name(experiment_name).experiment_id}")
+
+    #################### MlFlow Setup ####################
+    USE_ARGS = False
+    if USE_ARGS:
+        # Parse arguments
+        if len(sys.argv) != 3:
+            raise Exception('Include the data and model folders as arguments, e.g., python train_model.py data model.')
+
+        data_directory = sys.argv[1]
+        model_directory = sys.argv[2]
+    else:
+        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/train_data"
+        model_directory = os.path.join(run_dir, "model")
+
+    training_code(data_directory, model_directory) 
+
+    print('Done.')

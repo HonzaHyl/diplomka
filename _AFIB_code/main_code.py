@@ -40,21 +40,21 @@ STEP_SIZE   = 2496  # 20.096 second stride 10048 2496
 CONFIG = {
     "learning_rate": 1e-4,
     "LR_scheduler": "OneCycleLR",
-    "pct_start": 0.15, 
-    "anneal_strategy": "linear",
+    "pct_start": 0.3, 
+    "anneal_strategy": "cos",
     "optimizer": "AdamW",
     "weight_decay": 1e-3,
     "epochs": 30,
     
     # Layers to train (unfrozen from the start)
     "layer_tuning": {
-        "conv": {"trainable": True, "lr": 1e-8},
-        "bn":   {"trainable": True, "lr": 1e-8},
-        "rb_0": {"trainable": True, "lr": 1e-7},
-        "rb_1": {"trainable": True, "lr": 1e-7},
-        "rb_2": {"trainable": True, "lr": 1e-7},
-        "rb_3": {"trainable": True,  "lr": 1e-6}, # Low LR to protect pretrained features during high-LR phase
-        "rb_4": {"trainable": True,  "lr": 1e-6}, # Low LR to protect pretrained features during high-LR phase
+        "conv": {"trainable": True, "lr": 1e-7},
+        "bn":   {"trainable": True, "lr": 1e-7},
+        "rb_0": {"trainable": True, "lr": 1e-6},
+        "rb_1": {"trainable": True, "lr": 1e-6},
+        "rb_2": {"trainable": True, "lr": 1e-6},
+        "rb_3": {"trainable": True,  "lr": 5e-6}, 
+        "rb_4": {"trainable": True,  "lr": 5e-6}, 
         "fc_1": {"trainable": True,  "lr": 1e-4}
     }
 }
@@ -445,7 +445,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             steps_per_epoch=steps_per_epoch,
             epochs=CONFIG["epochs"] - start_epoch,
             pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "linear"),
+            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
             cycle_momentum=False
         )
         # scheduler.load_state_dict(checkpoint['scheduler_state_dict']) # <-- TEMPORARILY DISABLED: Restart the schedule!
@@ -460,7 +460,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             steps_per_epoch=steps_per_epoch,
             epochs=CONFIG["epochs"],
             pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "linear"),
+            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
             cycle_momentum=False
         )
     
@@ -647,16 +647,18 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
             # Get raw logits for all windows: [num_windows, 2]
             y = model(windows_tensor, l_expanded)
             
-            # Patient-level prediction: take the MAX logits across windows, then softmax.
-            # Max aggregation picks the most "alarming" window, which is more
-            # clinically appropriate for AFib recurrence — an episodic condition
-            # where a single suspicious strip matters more than the average.
-            max_logits = y.max(dim=0, keepdim=True)[0]  # [1, 2]
-            patient_p = torch.softmax(max_logits, dim=1)  # [1, 2]
+            # Patient-level prediction: Top-K Average Pooling across windows.
+            # Averages the top K logits to isolate alarm signals without being
+            # too sensitive to single-window noise artifacts (which Max pooling suffers from).
+            k = min(3, y.shape[0])
+            topk_vals = torch.topk(y, k=k, dim=0)[0]           # [k, 2]
+            agg_logits = topk_vals.mean(dim=0, keepdim=True)   # [1, 2]
             
-            # True validation loss: feed max logits into FocalLoss
+            patient_p = torch.softmax(agg_logits, dim=1)  # [1, 2]
+            
+            # True validation loss: feed aggregated logits into loss function
             t_indices = torch.argmax(t, dim=1)
-            batch_loss = loss_fn(input=max_logits, target=t_indices)
+            batch_loss = loss_fn(input=agg_logits, target=t_indices)
             total_loss += batch_loss.item()
             num_batches += 1
 

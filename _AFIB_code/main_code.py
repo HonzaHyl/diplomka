@@ -380,8 +380,8 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # Setup information about the class weights (class imbalace) for the focal loss
     class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
     #soft_weights = torch.tensor([0.70, 0.30], dtype=torch.float).to(DEVICE)
-    loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
-    # loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    #loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     
     start_epoch = 0
     scaler = torch.amp.GradScaler('cuda')

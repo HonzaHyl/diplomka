@@ -7,3 +7,4 @@ results
 training_run
 ecg_inspection_plots
 /_BCOSified/finetune_run
+/_AFIB_code/__pycache__

@@ -48,11 +48,11 @@ CONFIG = {
     
     # Layers to train (all unfrozen from the start)
     "layer_tuning": {
-        "conv": {"trainable": True, "lr": 1e-7},
-        "bn":   {"trainable": True, "lr": 1e-7},
-        "rb_0": {"trainable": True, "lr": 1e-6},
-        "rb_1": {"trainable": True, "lr": 1e-6},
-        "rb_2": {"trainable": True, "lr": 1e-6},
+        "conv": {"trainable": False, "lr": 1e-7},
+        "bn":   {"trainable": False, "lr": 1e-7},
+        "rb_0": {"trainable": True, "lr": 1e-7},
+        "rb_1": {"trainable": True, "lr": 1e-7},
+        "rb_2": {"trainable": True, "lr": 1e-7},
         "rb_3": {"trainable": True,  "lr": 1e-6}, 
         "rb_4": {"trainable": True,  "lr": 1e-6},
         "fc_1": {"trainable": True,  "lr": 1e-4}
@@ -351,7 +351,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # )
 
     train = DataLoader(dataset=train,
-                       batch_size=32,
+                       batch_size=16,
                        shuffle=True,  # Added shuffle=True since sampler is disabled
                        num_workers=8,
                        collate_fn=collate_fn,
@@ -384,11 +384,14 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     
     start_epoch = 0
+    scaler = torch.amp.GradScaler('cuda')
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         print(f"Loading checkpoint '{resume_checkpoint}'")
         checkpoint = torch.load(resume_checkpoint, map_location=DEVICE)
         start_epoch = checkpoint['epoch'] + 1
         model.load_state_dict(checkpoint['model_state_dict'])
+        if 'scaler_state_dict' in checkpoint and checkpoint['scaler_state_dict'] is not None:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
         print(f"Loaded checkpoint '{resume_checkpoint}' (resuming from epoch {start_epoch})")
 
     # Single-stage: build optimizer and OneCycleLR over all epochs
@@ -409,19 +412,35 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
 
     mlflow.log_params(CONFIG)
 
+    # --- Per-patient prediction tracker ---
+    # valid has shuffle=False & batch_size=1, so iteration order == files_df order.
+    # Internal label convention: argmax of one-hot target → 0=recurrence, 1=healthy
+    valid_patient_names = [Path(h).stem for h in valid.dataset.files_df['header'].tolist()]
+    valid_gt_labels = np.argmax(
+        np.stack(valid.dataset.files_df['target'].to_list(), axis=0), axis=1
+    ).tolist()  # 0=recurrence, 1=healthy
+    prediction_tracker = pd.DataFrame({
+        'patient_file': valid_patient_names,
+        'ground_truth': valid_gt_labels,  # 0=recurrence, 1=healthy
+    })
+
     OUTPUT = []
     EPOCHS = CONFIG["epochs"]
     for epoch in range(start_epoch, EPOCHS):
         print(f"============================[{epoch}]============================")
         
         # Unpack the new train loss
-        train_loss, train_auprc, train_auroc, train_f1, train_cm = train_part(model, train, opt, loss_fn, scheduler=scheduler)
+        train_loss, train_auprc, train_auroc, train_f1, train_cm = train_part(model, train, opt, loss_fn, scaler=scaler, scheduler=scheduler)
         print(f"Train | Loss: {train_loss:.4f} | AUPRC: {train_auprc:.4f} | AUROC: {train_auroc:.4f} | F1: {train_f1:.4f}")
         
         # Pass loss_fn to validation and unpack the new valid loss
         valid_loss, valid_auprc, valid_auroc, valid_f1, valid_cm, valid_targets, valid_outputs, best_threshold = valid_part(model, valid, loss_fn)
         print(f"Valid | Loss: {valid_loss:.4f} | AUPRC: {valid_auprc:.4f} | AUROC: {valid_auroc:.4f} | F1: {valid_f1:.4f}")
         print(f"Valid Confusion Matrix:\n{valid_cm}")
+
+        # Record predicted label for each patient this epoch (0=recurrence, 1=healthy)
+        epoch_preds = np.argmax(valid_outputs, axis=1).tolist()
+        prediction_tracker[f'epoch_{epoch}_pred'] = epoch_preds
 
         tn, fp, fn, tp = valid_cm.ravel()
         current_lr = scheduler.get_last_lr()[0] if scheduler is not None else opt.param_groups[0]['lr']
@@ -452,12 +471,21 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': opt.state_dict(),
             'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-            'valid_auroc': valid_auroc # Optional: handy to know how good this epoch was
+            'scaler_state_dict': scaler.state_dict(),
+            'valid_auroc': valid_auroc
         }, checkpoint_path)
         
         # 3. Log the file to MLflow under a "checkpoints" folder
         mlflow.log_artifact(local_path=checkpoint_path, artifact_path="checkpoints")
         
+    # Log per-patient, per-epoch predictions as an MLflow table
+    # Renders as an interactive table in the MLflow UI (requires MLflow >= 2.0)
+    mlflow.log_table(
+        data=prediction_tracker,
+        artifact_file=f"predictions/predictions_{ensamble_ID}.json"
+    )
+    print(f"Logged per-patient prediction table to MLflow (predictions/predictions_{ensamble_ID}.json)")
+
     writer.close()
     
     name = Path(model_directory, f'PROGRESS_{ensamble_ID}.pickle')
@@ -469,7 +497,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
 
 
 
-def train_part(model, dataset, opt, loss_fn, scheduler=None):
+def train_part(model, dataset, opt, loss_fn, scaler=None, scheduler=None):
     targets = []
     outputs = []
     total_loss = 0.0
@@ -516,28 +544,37 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
         l = l.float().to(DEVICE)
         l_expanded = l.repeat(num_windows, 1)
 
-        # Forward all windows
-        y = model(windows_tensor, l_expanded)          # [num_windows*B, 2]
-        y = y.view(num_windows, b, -1)                # [num_windows, B, 2]
+        # AMP forward pass
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=(scaler is not None)):
+            # Forward all windows
+            y = model(windows_tensor, l_expanded)          # [num_windows*B, 2]
+            y = y.view(num_windows, b, -1)                # [num_windows, B, 2]
 
-        # Top-K aggregation 
-        k = min(3, num_windows)
-        agg_logits = torch.topk(y, k=k, dim=0)[0].mean(dim=0)  # [B, 2]
+            # Top-K aggregation
+            k = min(3, num_windows)
+            agg_logits = torch.topk(y, k=k, dim=0)[0].mean(dim=0)  # [B, 2]
 
-        t_indices = torch.argmax(t, dim=1)
-        J = loss_fn(input=agg_logits, target=t_indices)
+            t_indices = torch.argmax(t, dim=1)
+            J = loss_fn(input=agg_logits, target=t_indices)
 
-        J.backward()
+        if scaler is not None:
+            scaler.scale(J).backward()
+            scaler.unscale_(opt)  # unscale before grad clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            J.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            opt.step()
 
         total_loss += J.item()
         num_batches += 1
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
-        opt.step()
         if scheduler is not None:
             scheduler.step()
 
-        p = torch.softmax(agg_logits, dim=1)
+        p = torch.softmax(agg_logits.float(), dim=1)  # cast back to fp32 for metrics
         targets.append(t_indices.data.cpu().numpy())
         outputs.append(p.data.cpu().numpy())
 

@@ -46,15 +46,15 @@ CONFIG = {
     "weight_decay": 1e-3,
     "epochs": 30,
     
-    # Layers to train (unfrozen from the start)
+    # Layers to train (all unfrozen from the start)
     "layer_tuning": {
         "conv": {"trainable": True, "lr": 1e-7},
         "bn":   {"trainable": True, "lr": 1e-7},
         "rb_0": {"trainable": True, "lr": 1e-6},
         "rb_1": {"trainable": True, "lr": 1e-6},
         "rb_2": {"trainable": True, "lr": 1e-6},
-        "rb_3": {"trainable": True,  "lr": 5e-6}, 
-        "rb_4": {"trainable": True,  "lr": 5e-6}, 
+        "rb_3": {"trainable": True,  "lr": 1e-6}, 
+        "rb_4": {"trainable": True,  "lr": 1e-6},
         "fc_1": {"trainable": True,  "lr": 1e-4}
     }
 }
@@ -243,71 +243,27 @@ class CustomDataset(Dataset):
         return problematic_list
     
     def __len__(self):
-        if self.is_train == True:
-            return len(self.window_map)
-        elif self.is_train == False:
-            return len(self.files_df)
+        return len(self.files_df)
 
     def __getitem__(self, index):
+        row = self.files_df.iloc[index]
+        data = np.load(row['npy_path']).astype(np.float32)
+
         if self.is_train:
-            # --- TRAINING: 10-second slices ---
-            sig_idx, window_start = self.window_map[index]
-            row = self.files_df.iloc[sig_idx]
-            
-            # Fast load
-            data = np.load(row['npy_path'], mmap_mode='r')
-            sig_len = data.shape[1]
-            
-            # 1. Random Shift Augmentation (Jitter)
-            # Instead of grabbing the exact same fixed window every epoch, we shift it randomly 
-            # by up to +/- 1 second (500 samples), forcing the model to learn translation invariance.
-            max_shift = 500
-            min_start = max(0, window_start - max_shift)
-            max_start = min(sig_len - self.window_size, window_start + max_shift)
-            
-            if min_start < max_start:
-                actual_start = np.random.randint(min_start, max_start + 1)
-            else:
-                actual_start = window_start # Fallback if signal is short
-                
-            window = data[:, actual_start : actual_start + self.window_size].copy()
-            
-            # --- NEW DATA AUGMENTATIONS ---
-            # 1. Amplitude scaling (between 80% and 120%)
+            # Augmentations applied to the whole signal
             scale = np.random.uniform(0.8, 1.2)
-            window = window * scale
-            
-            # 2. Gaussian noise (mu=0, sigma=0.05) to simulate sensor noise
-            noise = np.random.normal(0, 0.05, window.shape)
-            window = window + noise
-            
-            # 3. Random Polarity Inversion (20% chance)
-            # TEMPORARILY DISABLED: Destroying the electrical axis on a 10-second strip is too aggressive.
-            # if np.random.rand() > 0.8:
-            #     window = -window
-                
-            # 4. Cutout / Time Masking (50% chance)
-            # TEMPORARILY DISABLED: Erasing 1 whole second out of a 10s strip deletes a full P-QRS complex!
-            # if np.random.rand() > 0.5:
-            #     mask_len = np.random.randint(1, int(self.window_size * 0.10) + 1)
-            #     mask_start = np.random.randint(0, self.window_size - mask_len)
-            #     window[:, mask_start : mask_start + mask_len] = 0.0
-            # ------------------------------
+            data = data * scale
+            noise = np.random.normal(0, 0.05, data.shape)
+            data = data + noise
 
-            return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
-        else:
-            # --- VALIDATION: Full length signal ---
-            row = self.files_df.iloc[index]
-            data = np.load(row['npy_path']).astype(np.float32)
+        # Pad to multiple of 64
+        seq_len = data.shape[1]
+        remainder = seq_len % 64
+        if remainder != 0:
+            pad_len = 64 - remainder
+            data = np.pad(data, ((0, 0), (0, pad_len)), mode='constant', constant_values=0)
 
-            # Pad length to be a perfect multiple of 64
-            seq_len = data.shape[1]
-            remainder = seq_len % 64
-            if remainder != 0:
-                pad_len = 64 - remainder
-                data = np.pad(data, ((0, 0), (0, pad_len)), mode='constant', constant_values=0)
-
-            return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
+        return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
         
 
 def training_code(data_directory, model_directory, resume_checkpoint=None):
@@ -395,7 +351,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # )
 
     train = DataLoader(dataset=train,
-                       batch_size=128,
+                       batch_size=32,
                        shuffle=True,  # Added shuffle=True since sampler is disabled
                        num_workers=8,
                        collate_fn=collate_fn,
@@ -424,46 +380,33 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # Setup information about the class weights (class imbalace) for the focal loss
     class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
     #soft_weights = torch.tensor([0.70, 0.30], dtype=torch.float).to(DEVICE)
-    #loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
+    # loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     
     start_epoch = 0
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         print(f"Loading checkpoint '{resume_checkpoint}'")
         checkpoint = torch.load(resume_checkpoint, map_location=DEVICE)
         start_epoch = checkpoint['epoch'] + 1
-        
-        opt = build_flexible_optimizer(model, CONFIG)
         model.load_state_dict(checkpoint['model_state_dict'])
-        # opt.load_state_dict(checkpoint['optimizer_state_dict']) # <-- TEMPORARILY DISABLED: We want a fresh Learning Rate!
-        
-        steps_per_epoch = len(train)
-        max_lrs = [group['lr'] for group in opt.param_groups]
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=max_lrs,
-            steps_per_epoch=steps_per_epoch,
-            epochs=CONFIG["epochs"] - start_epoch,
-            pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
-            cycle_momentum=False
-        )
-        # scheduler.load_state_dict(checkpoint['scheduler_state_dict']) # <-- TEMPORARILY DISABLED: Restart the schedule!
         print(f"Loaded checkpoint '{resume_checkpoint}' (resuming from epoch {start_epoch})")
-    else:
-        opt = build_flexible_optimizer(model, CONFIG)
-        steps_per_epoch = len(train)
-        max_lrs = [group['lr'] for group in opt.param_groups]
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=max_lrs,
-            steps_per_epoch=steps_per_epoch,
-            epochs=CONFIG["epochs"],
-            pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
-            cycle_momentum=False
-        )
-    
+
+    # Single-stage: build optimizer and OneCycleLR over all epochs
+    opt = build_flexible_optimizer(model, CONFIG)
+    steps_per_epoch = len(train)
+    max_lrs = [group['lr'] for group in opt.param_groups]
+    completed_steps = start_epoch * steps_per_epoch
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=max_lrs,
+        steps_per_epoch=steps_per_epoch,
+        epochs=CONFIG["epochs"],
+        pct_start=CONFIG.get("pct_start", 0.3),
+        anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
+        cycle_momentum=False,
+        last_epoch=completed_steps - 1 if completed_steps > 0 else -1
+    )
+
     mlflow.log_params(CONFIG)
 
     OUTPUT = []
@@ -481,12 +424,12 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
         print(f"Valid Confusion Matrix:\n{valid_cm}")
 
         tn, fp, fn, tp = valid_cm.ravel()
-        current_lr = scheduler.get_last_lr()[0]
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else opt.param_groups[0]['lr']
 
         # MLflow Logging (Add the losses here)
         mlflow.log_metrics({
-            'train_loss': train_loss,   # <-- NEW
-            'valid_loss': valid_loss,   # <-- NEW
+            'train_loss': train_loss,
+            'valid_loss': valid_loss,   
             'train_auprc': train_auprc,
             'train_auroc': train_auroc,
             'train_f1': train_f1,
@@ -508,7 +451,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': opt.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
             'valid_auroc': valid_auroc # Optional: handy to know how good this epoch was
         }, checkpoint_path)
         
@@ -548,41 +491,45 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
     for (x, t, l) in dataset:
         opt.zero_grad()
 
-        x = x.unsqueeze(2).float().to(DEVICE)
+        sig_len = x.shape[-1]
+        window_size = WINDOW_SIZE
+        step_size = STEP_SIZE
+
+        if sig_len < window_size:
+            x = torch.nn.functional.pad(x, (0, window_size - sig_len), "constant", 0)
+            sig_len = window_size
+
+        windows = []
+        for start in range(0, sig_len - window_size + 1, step_size):
+            windows.append(x[:, :, start : start + window_size])
+        if len(windows) == 0:
+            windows.append(x[:, :, -window_size:])
+
+        # windows_tensor: [num_windows, B, C, W]
+        windows_tensor = torch.stack(windows, dim=0)
+        num_windows, b, c, w = windows_tensor.shape
+
+        # Flatten to [num_windows*B, C, 1, W] for model
+        windows_tensor = windows_tensor.view(num_windows * b, c, w).unsqueeze(2).to(DEVICE)
+
         t = t.to(DEVICE)
         l = l.float().to(DEVICE)
+        l_expanded = l.repeat(num_windows, 1)
 
-        # --- Mixup Data Augmentation ---
-        # Turning Mixup back ON to combat the massive overfitting seen in the logs 
-        apply_mixup = np.random.rand() > 0.5 
-   
-        if apply_mixup:
-            # Beta distribution for combining samples
-            alpha = 0.2
-            lam = np.random.beta(alpha, alpha)
-            
-            # Shuffle indices to mix within the batch
-            index = torch.randperm(x.size(0)).to(DEVICE)
-            
-            x = lam * x + (1 - lam) * x[index]
-            t_a, t_b = t, t[index]
-            
-            y = model(x, l)
-            
-            t_indices_a = torch.argmax(t_a, dim=1)
-            t_indices_b = torch.argmax(t_b, dim=1)
-            
-            J = lam * loss_fn(input=y, target=t_indices_a) + (1 - lam) * loss_fn(input=y, target=t_indices_b)
-            t_indices = t_indices_a # For metrics approximation
-        else:
-            y = model(x, l)
-            t_indices = torch.argmax(t, dim=1)
-            J = loss_fn(input=y, target=t_indices)
-        # -------------------------------
+        # Forward all windows
+        y = model(windows_tensor, l_expanded)          # [num_windows*B, 2]
+        y = y.view(num_windows, b, -1)                # [num_windows, B, 2]
+
+        # Top-K aggregation 
+        k = min(3, num_windows)
+        agg_logits = torch.topk(y, k=k, dim=0)[0].mean(dim=0)  # [B, 2]
+
+        t_indices = torch.argmax(t, dim=1)
+        J = loss_fn(input=agg_logits, target=t_indices)
 
         J.backward()
-        
-        total_loss += J.item() # <-- Track loss
+
+        total_loss += J.item()
         num_batches += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
@@ -590,7 +537,7 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
         if scheduler is not None:
             scheduler.step()
 
-        p = torch.softmax(y, dim=1)
+        p = torch.softmax(agg_logits, dim=1)
         targets.append(t_indices.data.cpu().numpy())
         outputs.append(p.data.cpu().numpy())
 
@@ -637,26 +584,25 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
             if len(windows) == 0:
                 windows.append(x[:, :, -window_size:])
                 
-            windows_tensor = torch.cat(windows, dim=0).to(DEVICE)
-            windows_tensor = windows_tensor.unsqueeze(2)
-
+            windows_tensor = torch.stack(windows, dim=0)
+            num_windows, b, c, w = windows_tensor.shape
+            
+            windows_tensor = windows_tensor.view(num_windows * b, c, w).unsqueeze(2).to(DEVICE)
+            
             t = t.to(DEVICE)
             l = l.float().to(DEVICE)
-            l_expanded = l.expand(windows_tensor.shape[0], -1)
+            l_expanded = l.repeat(num_windows, 1)
             
-            # Get raw logits for all windows: [num_windows, 2]
             y = model(windows_tensor, l_expanded)
             
-            # Patient-level prediction: Top-K Average Pooling across windows.
-            # Averages the top K logits to isolate alarm signals without being
-            # too sensitive to single-window noise artifacts (which Max pooling suffers from).
-            k = min(3, y.shape[0])
-            topk_vals = torch.topk(y, k=k, dim=0)[0]           # [k, 2]
-            agg_logits = topk_vals.mean(dim=0, keepdim=True)   # [1, 2]
+            y = y.view(num_windows, b, -1)
             
-            patient_p = torch.softmax(agg_logits, dim=1)  # [1, 2]
+            k = min(3, num_windows)
+            topk_vals = torch.topk(y, k=k, dim=0)[0]           # [k, B, C]
+            agg_logits = topk_vals.mean(dim=0)                 # [B, C]
             
-            # True validation loss: feed aggregated logits into loss function
+            patient_p = torch.softmax(agg_logits, dim=1)
+            
             t_indices = torch.argmax(t, dim=1)
             batch_loss = loss_fn(input=agg_logits, target=t_indices)
             total_loss += batch_loss.item()
@@ -687,11 +633,12 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
 
 
 def collate_fn(batch):
-    # batch: list of tuples (x, t, l)
-    
-    # Stack inputs along batch dimension
-    X = torch.stack([b[0] for b in batch], dim=0)
-    t = torch.stack([b[1] for b in batch], dim=0)
-    l = torch.stack([b[2] for b in batch], dim=0)
-    
-    return X, t, l
+    xs  = [b[0] for b in batch]
+    t   = torch.stack([b[1] for b in batch], dim=0)
+    l   = torch.stack([b[2] for b in batch], dim=0)
+
+    # Pad to longest signal in the batch (signals may differ slightly after pad-to-64)
+    max_len = max(x.shape[1] for x in xs)
+    xs = [torch.nn.functional.pad(x, (0, max_len - x.shape[1])) if x.shape[1] < max_len else x
+          for x in xs]
+    return torch.stack(xs, dim=0), t, l

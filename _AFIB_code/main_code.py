@@ -561,17 +561,23 @@ def train_part(model, dataset, opt, loss_fn, scaler=None, scheduler=None):
             scaler.scale(J).backward()
             scaler.unscale_(opt)  # unscale before grad clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
+            scale_before = scaler.get_scale()
             scaler.step(opt)
             scaler.update()
+            # Only step scheduler when the optimizer actually stepped.
+            # If inf/nan gradients were detected, scaler skips opt.step()
+            # and reduces the scale — scheduler must not advance in that case.
+            optimizer_stepped = (scaler.get_scale() == scale_before)
         else:
             J.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
             opt.step()
+            optimizer_stepped = True
 
         total_loss += J.item()
         num_batches += 1
 
-        if scheduler is not None:
+        if scheduler is not None and optimizer_stepped:
             scheduler.step()
 
         p = torch.softmax(agg_logits.float(), dim=1)  # cast back to fp32 for metrics

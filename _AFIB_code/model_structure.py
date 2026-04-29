@@ -50,10 +50,10 @@ class NN(nn.Module):
         self.rb_4 = MyResidualBlock(downsample=True)
 
         self.pool_max = nn.AdaptiveMaxPool1d(output_size=1)
-        self.pool_avg = nn.AdaptiveAvgPool1d(output_size=1)
+
         
         # 256 (max) + 256 (avg) + 12 (leads) = 524
-        self.fc_1 = nn.Linear(256 + 256 + 12, nOUT)
+        self.fc_1 = nn.Linear(256 + 12, nOUT)
 
     def forward(self, x, l):
         x = F.leaky_relu(self.bn(self.conv(x)))
@@ -69,10 +69,10 @@ class NN(nn.Module):
         
         # Apply both poolings to capture peak and global activations
         x_max = self.pool_max(x).squeeze(2) # Shape: [Batch, 256]
-        x_avg = self.pool_avg(x).squeeze(2) # Shape: [Batch, 256]
+ 
         
         # Concatenate: peak features + global features + lead mask
-        x = torch.cat((x_max, x_avg, l), dim=1)  # [Batch, 524]
+        x = torch.cat((x_max, l), dim=1)  # [Batch, 524]
         x = F.dropout(x, p=0.5, training=self.training)  # Regularise the classification head
         x = self.fc_1(x)
         

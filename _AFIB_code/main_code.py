@@ -46,27 +46,27 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark     = False
 # ─────────────────────────────────────────────────────────────────────────────
 
-WINDOW_SIZE = 4992 # 30.08 seconds (Multiple of 64) 15040 4992
-STEP_SIZE   = 2496  # 20.096 second stride 10048 2496
+WINDOW_SIZE = 4992 # 10 seconds (Multiple of 64) 15040 4992
+STEP_SIZE   = 2496  # 5 second stride 10048 2496
 
 CONFIG = {
     "learning_rate": 1e-4,
     "LR_scheduler": "OneCycleLR",
-    "pct_start": 0.2, 
+    "pct_start": 0.3, 
     "anneal_strategy": "cos",
     "optimizer": "AdamW",
-    "weight_decay": 1e-3,
-    "epochs": 50,
+    "weight_decay": 1e-2,
+    "epochs": 30,
     
-    # Layers to train (unfrozen from the start)
+    # Layers to train
     "layer_tuning": {
         "conv": {"trainable": False, "lr": 1e-7},
         "bn":   {"trainable": False, "lr": 1e-7},
         "rb_0": {"trainable": True, "lr": 1e-7},
         "rb_1": {"trainable": True, "lr": 1e-7},
         "rb_2": {"trainable": True, "lr": 1e-7},
-        "rb_3": {"trainable": True,  "lr": 5e-6}, 
-        "rb_4": {"trainable": True,  "lr": 5e-6}, 
+        "rb_3": {"trainable": True,  "lr": 1e-6}, 
+        "rb_4": {"trainable": True,  "lr": 1e-6}, 
         "fc_1": {"trainable": True,  "lr": 1e-4}
     }
 }
@@ -147,6 +147,12 @@ class FocalLoss(nn.Module):
             return focal_loss
 
 
+# ── ECG Augmentation constants (train-only) ──────────────────────────────────
+AUG_AMP_MIN   = 0.85   # minimum amplitude scale factor
+AUG_AMP_MAX   = 1.15   # maximum amplitude scale factor
+AUG_NOISE_STD = 0.003  # Gaussian noise σ — chosen well below P-wave amplitude
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Class that creates custom dataset from given data
 class CustomDataset(Dataset):
 
@@ -191,7 +197,15 @@ class CustomDataset(Dataset):
                 print(f"Warning: {npy_path} not found.")
 
         self.files_df = pd.DataFrame(self.files).sort_values('header').reset_index(drop=True)
-        self.window_map = [(i, start) for i, row in self.files_df.iterrows() for start in row['start_indices']]
+        # Each entry: (file_index, window_start, flipped)
+        # flipped=False → original; flipped=True → polarity-inverted copy (train only)
+        self.window_map = [(i, start, False) for i, row in self.files_df.iterrows() for start in row['start_indices']]
+
+    def _add_flipped_windows(self):
+        """Append polarity-inverted copies of every window to window_map.
+        Call ONLY after the train/valid split to ensure zero leakage."""
+        flipped = [(i, start, True) for (i, start, _) in self.window_map]
+        self.window_map = self.window_map + flipped
 
     def train_valid_split(self, test_size):
         files = self.files_df['header'].to_numpy().reshape(-1,1)
@@ -202,10 +216,12 @@ class CustomDataset(Dataset):
         train = CustomDataset(header_paths=x_train[:,0].tolist())
         train.is_train=True
         train.num_leads=None
+        train._add_flipped_windows()  # doubles the training set via polarity flip
 
         valid = CustomDataset(header_paths=x_valid[:,0].tolist())
         valid.is_train=False
         valid.num_leads=12
+        # NOTE: no flip added to valid — zero leakage
 
         return train, valid
     
@@ -230,11 +246,13 @@ class CustomDataset(Dataset):
             train_dataset = CustomDataset(header_paths=train_headers)
             train_dataset.is_train = True
             train_dataset.num_leads = None
+            train_dataset._add_flipped_windows()  # doubles the training set via polarity flip
 
             # Create validation dataset instance
             valid_dataset = CustomDataset(header_paths=valid_headers)
             valid_dataset.is_train = False
             valid_dataset.num_leads = 12
+            # NOTE: no flip added to valid — zero leakage
             
             splits.append((train_dataset, valid_dataset))
             
@@ -262,14 +280,32 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, index):
         if self.is_train:
-            # --- TRAINING: fixed-size window slices ---
-            sig_idx, start = self.window_map[index]
+            # --- TRAINING: fixed-size window slices + augmentation ---
+            sig_idx, start, flipped = self.window_map[index]
             row = self.files_df.iloc[sig_idx]
             data = np.load(row['npy_path'], mmap_mode='r').astype(np.float32)
-            window = data[:, start : start + self.window_size]
-            return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
+            window = data[:, start : start + self.window_size].copy()  # writable copy
+
+            # 1. Polarity flip (horizontal-axis inversion of all leads)
+            if flipped:
+                window = -window
+
+            # 2. Mild amplitude augmentation (random scale ±15%)
+            amp_scale = np.random.uniform(AUG_AMP_MIN, AUG_AMP_MAX)
+            window = window * amp_scale
+
+            # 3. Very mild Gaussian noise — σ kept well below P-wave amplitude
+            noise = np.random.normal(0.0, AUG_NOISE_STD, size=window.shape).astype(np.float32)
+            window = window + noise
+
+            # 4. Spatial Lead Dropout (random choice of lead configurations)
+            # Simulates 2, 3, 4, 6, 8, or 12-lead machines dynamically
+            lead_indicator = np.ones(12)
+            window, lead_indicator = lead_exctractor.get(window, self.num_leads, lead_indicator)
+
+            return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
         else:
-            # --- VALIDATION: Full length signal ---
+            # --- VALIDATION: Full length signal — NO augmentation ---
             row = self.files_df.iloc[index]
             data = np.load(row['npy_path']).astype(np.float32)
 
@@ -280,7 +316,10 @@ class CustomDataset(Dataset):
                 pad_len = 64 - remainder
                 data = np.pad(data, ((0, 0), (0, pad_len)), mode='constant', constant_values=0)
 
-            return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
+            lead_indicator = np.ones(12)
+            data, lead_indicator = lead_exctractor.get(data, self.num_leads, lead_indicator)
+
+            return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
         
 
 def training_code(data_directory, model_directory, resume_checkpoint=None):
@@ -349,7 +388,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     
     # 2. Assign the appropriate weight to every single window in the dataset
     sample_weights = []
-    for sig_idx, _ in train.window_map:
+    for sig_idx, _start, _flipped in train.window_map:
         # Grab the target vector (e.g., [1, 0] or [0, 1]) and find the class index
         target_vector = train.files_df.iloc[sig_idx]['target']
         class_idx = np.argmax(target_vector)

@@ -35,7 +35,7 @@ def load_header(header_path):
 # Find header and recording files.
 def find_header_files(data_directory):
     header_files = list()
-    for f in os.listdir(data_directory):
+    for f in sorted(os.listdir(data_directory)):   # sorted() → deterministic on Linux
         root, extension = os.path.splitext(f)
         if not root.startswith('.') and extension=='.hea':
             header_file = os.path.join(data_directory, root + '.hea')
@@ -144,10 +144,11 @@ class lead_exctractor():
     L12 = np.array([1,1,1,1,1,1,1,1,1,1,1,1])
 
     @staticmethod
-    def get (x,num_leads,lead_indicator):
+    def get (x,num_leads,lead_indicator, rng=None):
         if num_leads==None:
-            # random choice output
-            num_leads = random.choice([12,8,6,4,3,2])
+            # Deterministic random choice: use a seeded numpy RNG when provided.
+            _rng = rng if rng is not None else np.random.default_rng()
+            num_leads = int(_rng.choice([12, 8, 6, 4, 3, 2]))
 
         if num_leads==12:
             # Twelve leads: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6

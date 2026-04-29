@@ -30,9 +30,21 @@ from helper_code import load_header, get_nsamp, get_leads, get_sex, get_frequenc
 from helper_code import get_labels, lead_exctractor, load_recording, expand_leads, _load_model, finetune_model_prep
 
 from device_selector import DeviceSelector
+import torchmetrics
 
 selector = DeviceSelector()
 DEVICE = selector.select(1)[0]
+
+# ── Reproducibility seed ────────────────────────────────────────────────────
+SEED = 42
+random_module = __import__('random')
+random_module.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
+# ─────────────────────────────────────────────────────────────────────────────
 
 WINDOW_SIZE = 4992 # 30.08 seconds (Multiple of 64) 15040 4992
 STEP_SIZE   = 2496  # 20.096 second stride 10048 2496
@@ -40,19 +52,19 @@ STEP_SIZE   = 2496  # 20.096 second stride 10048 2496
 CONFIG = {
     "learning_rate": 1e-4,
     "LR_scheduler": "OneCycleLR",
-    "pct_start": 0.3, 
+    "pct_start": 0.2, 
     "anneal_strategy": "cos",
     "optimizer": "AdamW",
     "weight_decay": 1e-3,
-    "epochs": 30,
+    "epochs": 50,
     
     # Layers to train (unfrozen from the start)
     "layer_tuning": {
-        "conv": {"trainable": True, "lr": 1e-7},
-        "bn":   {"trainable": True, "lr": 1e-7},
-        "rb_0": {"trainable": True, "lr": 1e-6},
-        "rb_1": {"trainable": True, "lr": 1e-6},
-        "rb_2": {"trainable": True, "lr": 1e-6},
+        "conv": {"trainable": False, "lr": 1e-7},
+        "bn":   {"trainable": False, "lr": 1e-7},
+        "rb_0": {"trainable": True, "lr": 1e-7},
+        "rb_1": {"trainable": True, "lr": 1e-7},
+        "rb_2": {"trainable": True, "lr": 1e-7},
         "rb_3": {"trainable": True,  "lr": 5e-6}, 
         "rb_4": {"trainable": True,  "lr": 5e-6}, 
         "fc_1": {"trainable": True,  "lr": 1e-4}
@@ -178,7 +190,7 @@ class CustomDataset(Dataset):
             else:
                 print(f"Warning: {npy_path} not found.")
 
-        self.files_df = pd.DataFrame(self.files)
+        self.files_df = pd.DataFrame(self.files).sort_values('header').reset_index(drop=True)
         self.window_map = [(i, start) for i, row in self.files_df.iterrows() for start in row['start_indices']]
 
     def train_valid_split(self, test_size):
@@ -250,50 +262,11 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, index):
         if self.is_train:
-            # --- TRAINING: 10-second slices ---
-            sig_idx, window_start = self.window_map[index]
+            # --- TRAINING: fixed-size window slices ---
+            sig_idx, start = self.window_map[index]
             row = self.files_df.iloc[sig_idx]
-            
-            # Fast load
-            data = np.load(row['npy_path'], mmap_mode='r')
-            sig_len = data.shape[1]
-            
-            # 1. Random Shift Augmentation (Jitter)
-            # Instead of grabbing the exact same fixed window every epoch, we shift it randomly 
-            # by up to +/- 1 second (500 samples), forcing the model to learn translation invariance.
-            max_shift = 500
-            min_start = max(0, window_start - max_shift)
-            max_start = min(sig_len - self.window_size, window_start + max_shift)
-            
-            if min_start < max_start:
-                actual_start = np.random.randint(min_start, max_start + 1)
-            else:
-                actual_start = window_start # Fallback if signal is short
-                
-            window = data[:, actual_start : actual_start + self.window_size].copy()
-            
-            # --- NEW DATA AUGMENTATIONS ---
-            # 1. Amplitude scaling (between 80% and 120%)
-            scale = np.random.uniform(0.8, 1.2)
-            window = window * scale
-            
-            # 2. Gaussian noise (mu=0, sigma=0.05) to simulate sensor noise
-            noise = np.random.normal(0, 0.05, window.shape)
-            window = window + noise
-            
-            # 3. Random Polarity Inversion (20% chance)
-            # TEMPORARILY DISABLED: Destroying the electrical axis on a 10-second strip is too aggressive.
-            # if np.random.rand() > 0.8:
-            #     window = -window
-                
-            # 4. Cutout / Time Masking (50% chance)
-            # TEMPORARILY DISABLED: Erasing 1 whole second out of a 10s strip deletes a full P-QRS complex!
-            # if np.random.rand() > 0.5:
-            #     mask_len = np.random.randint(1, int(self.window_size * 0.10) + 1)
-            #     mask_start = np.random.randint(0, self.window_size - mask_len)
-            #     window[:, mask_start : mask_start + mask_len] = 0.0
-            # ------------------------------
-
+            data = np.load(row['npy_path'], mmap_mode='r').astype(np.float32)
+            window = data[:, start : start + self.window_size]
             return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.ones(12)
         else:
             # --- VALIDATION: Full length signal ---
@@ -394,13 +367,18 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     #     replacement=True
     # )
 
+    # Seeded generator so DataLoader shuffle is reproducible
+    _train_gen = torch.Generator()
+    _train_gen.manual_seed(SEED)
+
     train = DataLoader(dataset=train,
-                       batch_size=128,
+                       batch_size=256,
                        shuffle=True,  # Added shuffle=True since sampler is disabled
                        num_workers=8,
                        collate_fn=collate_fn,
                        pin_memory=True,
-                       drop_last=False)
+                       drop_last=False,
+                       generator=_train_gen)
 
 
     valid = DataLoader(dataset=valid,
@@ -424,8 +402,8 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # Setup information about the class weights (class imbalace) for the focal loss
     class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
     #soft_weights = torch.tensor([0.70, 0.30], dtype=torch.float).to(DEVICE)
-    #loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    loss_fn = FocalLoss(weight=class_weights, gamma=1.0)
+    #loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     
     start_epoch = 0
     if resume_checkpoint and os.path.exists(resume_checkpoint):
@@ -527,17 +505,25 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
 
 
 def train_part(model, dataset, opt, loss_fn, scheduler=None):
-    targets = []
-    outputs = []
+    from torchmetrics.classification import (
+        BinaryAUROC, BinaryAveragePrecision, BinaryF1Score, BinaryConfusionMatrix
+    )
+
+    # Initialize torchmetrics metrics and move them to DEVICE
+    metric_auroc = BinaryAUROC().to(DEVICE)
+    metric_auprc = BinaryAveragePrecision().to(DEVICE)
+    metric_f1    = BinaryF1Score().to(DEVICE)
+    metric_cm    = BinaryConfusionMatrix().to(DEVICE)
+
     total_loss = 0.0
     num_batches = 0
-    
+
     # Set the entire model to training mode
     model.train()
-    
+
     #PYTORCH GOTCHA FIX:
     # `model.train()` will reactivate BatchNorm running stats for the ENTIRE network.
-    # If a layer is supposed to be frozen (requires_grad=False), the BN layers inside it 
+    # If a layer is supposed to be frozen (requires_grad=False), the BN layers inside it
     # will STILL track new statistics, destroying your pre-trained weights!
     # We must loop through and force frozen BN layers back into `.eval()` mode.
     for m in model.modules():
@@ -552,37 +538,13 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
         t = t.to(DEVICE)
         l = l.float().to(DEVICE)
 
-        # --- Mixup Data Augmentation ---
-        # Turning Mixup back ON to combat the massive overfitting seen in the logs 
-        apply_mixup = np.random.rand() > 0.5 
-   
-        if apply_mixup:
-            # Beta distribution for combining samples
-            alpha = 0.2
-            lam = np.random.beta(alpha, alpha)
-            
-            # Shuffle indices to mix within the batch
-            index = torch.randperm(x.size(0)).to(DEVICE)
-            
-            x = lam * x + (1 - lam) * x[index]
-            t_a, t_b = t, t[index]
-            
-            y = model(x, l)
-            
-            t_indices_a = torch.argmax(t_a, dim=1)
-            t_indices_b = torch.argmax(t_b, dim=1)
-            
-            J = lam * loss_fn(input=y, target=t_indices_a) + (1 - lam) * loss_fn(input=y, target=t_indices_b)
-            t_indices = t_indices_a # For metrics approximation
-        else:
-            y = model(x, l)
-            t_indices = torch.argmax(t, dim=1)
-            J = loss_fn(input=y, target=t_indices)
-        # -------------------------------
+        y = model(x, l)
+        t_indices = torch.argmax(t, dim=1)
+        J = loss_fn(input=y, target=t_indices)
 
         J.backward()
-        
-        total_loss += J.item() # <-- Track loss
+
+        total_loss += J.item()
         num_batches += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
@@ -590,23 +552,28 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
         if scheduler is not None:
             scheduler.step()
 
-        p = torch.softmax(y, dim=1)
-        targets.append(t_indices.data.cpu().numpy())
-        outputs.append(p.data.cpu().numpy())
+        # Update torchmetrics: remap so that 1 = recurrence (positive class)
+        with torch.no_grad():
+            p = torch.softmax(y, dim=1)
+            pos_probs   = p[:, 0]                  # P(recurrence): higher = more likely recurrence
+            targets_sk  = 1 - t_indices            # 0→1 (recurrence), 1→0 (healthy)
 
-    targets = np.concatenate(targets, axis=0)
-    outputs = np.concatenate(outputs, axis=0)
-    
-    # Remap for sklearn: internally 0=recurrence, 1=healthy.
-    # Sklearn assumes 1=positive, so flip: 1=recurrence, 0=healthy.
-    targets_sk  = 1 - targets                       # 0→1 (recurrence), 1→0 (healthy)
-    pos_probs   = outputs[:, 0]                     # P(recurrence): higher = more likely recurrence
-    predictions = (1 - np.argmax(outputs, axis=1))  # argmax 0→pred 1 (recurrence), 1→pred 0 (healthy)
-    
-    auprc = average_precision_score(y_true=targets_sk, y_score=pos_probs)
-    auroc = roc_auc_score(y_true=targets_sk,           y_score=pos_probs)
-    f1    = f1_score(y_true=targets_sk,                y_pred=predictions)
-    cm    = confusion_matrix(y_true=targets_sk,        y_pred=predictions)
+            metric_auroc.update(pos_probs, targets_sk)
+            metric_auprc.update(pos_probs, targets_sk)
+            metric_f1.update(pos_probs, targets_sk)
+            metric_cm.update(pos_probs, targets_sk)
+
+    # Compute epoch-level aggregates
+    auroc = metric_auroc.compute().item()
+    auprc = metric_auprc.compute().item()
+    f1    = metric_f1.compute().item()
+    cm    = metric_cm.compute().cpu().numpy()
+
+    # Reset all metrics for the next epoch
+    metric_auroc.reset()
+    metric_auprc.reset()
+    metric_f1.reset()
+    metric_cm.reset()
 
     avg_train_loss = total_loss / num_batches
     return avg_train_loss, auprc, auroc, f1, cm
@@ -647,18 +614,22 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
             # Get raw logits for all windows: [num_windows, 2]
             y = model(windows_tensor, l_expanded)
             
-            # Patient-level prediction: Top-K Average Pooling across windows.
-            # Averages the top K logits to isolate alarm signals without being
-            # too sensitive to single-window noise artifacts (which Max pooling suffers from).
-            k = min(3, y.shape[0])
-            topk_vals = torch.topk(y, k=k, dim=0)[0]           # [k, 2]
-            agg_logits = topk_vals.mean(dim=0, keepdim=True)   # [1, 2]
+            # Convert each window's logits to probabilities FIRST
+            window_probs = torch.softmax(y, dim=1)
             
-            patient_p = torch.softmax(agg_logits, dim=1)  # [1, 2]
+            # Patient-level prediction: Top-K Average Pooling on probabilities
+            # This isolates the most suspicious windows without being completely 
+            # derailed by a single noise artifact, while avoiding dilution.
+            k = min(3, window_probs.shape[0])
+            topk_probs = torch.topk(window_probs, k=k, dim=0)[0]    # [k, 2]
+            patient_p = topk_probs.mean(dim=0, keepdim=True)        # [1, 2]
             
-            # True validation loss: feed aggregated logits into loss function
+            # True validation loss: FocalLoss expects logits. We can safely pass log(p)
+            # because FocalLoss internally applies log_softmax, and log_softmax(log(p)) = log(p).
+            pseudo_logits = torch.log(patient_p + 1e-8)
+            
             t_indices = torch.argmax(t, dim=1)
-            batch_loss = loss_fn(input=agg_logits, target=t_indices)
+            batch_loss = loss_fn(input=pseudo_logits, target=t_indices)
             total_loss += batch_loss.item()
             num_batches += 1
 

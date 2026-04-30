@@ -55,13 +55,13 @@ CONFIG = {
     "pct_start": 0.3, 
     "anneal_strategy": "cos",
     "optimizer": "AdamW",
-    "weight_decay": 1e-2,
+    "weight_decay": 1e-3,
     "epochs": 30,
     
     # Layers to train
     "layer_tuning": {
-        "conv": {"trainable": False, "lr": 1e-7},
-        "bn":   {"trainable": False, "lr": 1e-7},
+        "conv": {"trainable": True, "lr": 1e-7},
+        "bn":   {"trainable": True, "lr": 1e-7},
         "rb_0": {"trainable": True, "lr": 1e-7},
         "rb_1": {"trainable": True, "lr": 1e-7},
         "rb_2": {"trainable": True, "lr": 1e-7},
@@ -151,6 +151,7 @@ class FocalLoss(nn.Module):
 AUG_AMP_MIN   = 0.85   # minimum amplitude scale factor
 AUG_AMP_MAX   = 1.15   # maximum amplitude scale factor
 AUG_NOISE_STD = 0.003  # Gaussian noise σ — chosen well below P-wave amplitude
+AUG_CUTOUT_PROB = 0.5  # Probability to apply time cutout
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Class that creates custom dataset from given data
@@ -302,6 +303,13 @@ class CustomDataset(Dataset):
             # Simulates 2, 3, 4, 6, 8, or 12-lead machines dynamically
             lead_indicator = np.ones(12)
             window, lead_indicator = lead_exctractor.get(window, self.num_leads, lead_indicator)
+
+            # 5. Time Cutout (Regularization)
+            if np.random.rand() < AUG_CUTOUT_PROB:
+                # drop 10% to 20% of the signal in time
+                cutout_len = int(self.window_size * np.random.uniform(0.10, 0.20))
+                start_idx = np.random.randint(0, self.window_size - cutout_len)
+                window[:, start_idx : start_idx + cutout_len] = 0.0
 
             return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
         else:

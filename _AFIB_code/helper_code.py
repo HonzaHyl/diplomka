@@ -235,9 +235,9 @@ def finetune_model_prep(model):
     for param in model.parameters():
         param.requires_grad = True
 
-    # Create new last layer with 2 output features
-    in_features = model.fc_1.in_features
-    model.fc_1 = nn.Linear(in_features, 2)
+    # Create new last layer with 2 output features
+    in_features = model.head[-1].in_features
+    model.head[-1] = nn.Linear(in_features, 2)
 
 
     # Verify which parameters are trainable
@@ -245,6 +245,6 @@ def finetune_model_prep(model):
     for name, param in model.named_parameters():
             print(param.requires_grad)
 
-    print(model.fc_1.out_features)
+    print(model.head[-1].out_features)
 
     return model

@@ -53,8 +53,14 @@ class NN(nn.Module):
         self.pool_avg = nn.AdaptiveAvgPool1d(output_size=1)
 
         
-        # 256 (max) + 256 (avg) + 12 (leads) = 524
-        self.fc_1 = nn.Linear(256 + 256 + 12, nOUT)
+        # Non-linear classification head with batchnorm and dropout
+        self.head = nn.Sequential(
+            nn.Linear(256 + 256 + 12, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(p=0.5),
+            nn.Linear(128, nOUT)
+        )
 
     def forward(self, x, l):
         x = F.leaky_relu(self.bn(self.conv(x)))
@@ -65,7 +71,8 @@ class NN(nn.Module):
         x = self.rb_3(x)
         x = self.rb_4(x)
 
-        x = F.dropout(x, p=0.5, training=self.training)
+        # Spatial Dropout (Dropout2d drops entire 2D feature maps/channels)
+        x = F.dropout2d(x, p=0.3, training=self.training)
         x = x.squeeze(2)
         
         # Apply both poolings to capture peak and global activations
@@ -74,7 +81,6 @@ class NN(nn.Module):
         
         # Concatenate: peak features + global features + lead mask
         x = torch.cat((x_max, x_avg, l), dim=1)  # [Batch, 524]
-        x = F.dropout(x, p=0.5, training=self.training)  # Regularise the classification head
-        x = self.fc_1(x)
+        x = self.head(x)
         
         return x

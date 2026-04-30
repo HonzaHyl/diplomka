@@ -8,7 +8,7 @@ if __name__ == '__main__':
     #################### MlFlow Setup ####################
     db_url = "sqlite:////mnt/mdpm/d03/jhyl/deepstem_results/mlflow_runs.db"
     experiment_name = "BCOSified_finetuning"
-    artifact_path = "file:///mnt/mdpm/d03/jhyl/Afib_recurrence/diplomka/results/mlruns"
+    artifact_path = "file:///mnt/mdpm/d03/jhyl/diplomka/results/mlruns"
 
     mlflow.set_tracking_uri(db_url)
 
@@ -20,7 +20,7 @@ if __name__ == '__main__':
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"Training_KFold_{timestamp}"
-    run_dir = os.path.join("/srv/home/jhyl/Afib_recurrence/diplomka/results", run_name)
+    run_dir = os.path.join("/mnt/mdpm/d03/jhyl/diplomka/results", run_name)
     os.makedirs(os.path.join(run_dir, "checkpoints"), exist_ok=True)
     os.makedirs(os.path.join(run_dir, "model"), exist_ok=True)
     print(f"[INFO] Run directory created: {run_dir}")
@@ -40,7 +40,7 @@ if __name__ == '__main__':
         model_directory = sys.argv[2]
         resume_checkpoint = sys.argv[3] if len(sys.argv) == 4 else None
     else:
-        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/train_data"
+        data_directory = "/mnt/mdpm/d03/jhyl/diplomka/_BCOSified/finetune_run/train_data"
         model_directory = os.path.join(run_dir, "model")
         # To resume training, set the resume_checkpoint path here:
         #resume_checkpoint = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Training_20260324_130349/model/checkpoint_epoch_96.pth"

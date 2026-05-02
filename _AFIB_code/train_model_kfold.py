@@ -40,7 +40,7 @@ if __name__ == '__main__':
         model_directory = sys.argv[2]
         resume_checkpoint = sys.argv[3] if len(sys.argv) == 4 else None
     else:
-        data_directory = "/mnt/mdpm/d03/jhyl/diplomka/_BCOSified/finetune_run/train_data"
+        data_directory = "/mnt/mdpm/d03/jhyl/diplomka/finetune_data/SR_before/train"
         model_directory = os.path.join(run_dir, "model")
         # To resume training, set the resume_checkpoint path here:
         #resume_checkpoint = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Training_20260324_130349/model/checkpoint_epoch_96.pth"

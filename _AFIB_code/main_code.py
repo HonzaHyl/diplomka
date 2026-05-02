@@ -57,17 +57,18 @@ CONFIG = {
     "optimizer": "AdamW",
     "weight_decay": 1e-3,
     "epochs": 30,
+    "label_smoothing": 0.1,  # Added label smoothing
     
     # Layers to train
     "layer_tuning": {
-        "conv": {"trainable": True, "lr": 1e-7},
-        "bn":   {"trainable": True, "lr": 1e-7},
-        "rb_0": {"trainable": True, "lr": 1e-7},
+        "conv": {"trainable": False, "lr": 1e-7},
+        "bn":   {"trainable": False, "lr": 1e-7},
+        "rb_0": {"trainable": False, "lr": 1e-7},
         "rb_1": {"trainable": True, "lr": 1e-7},
         "rb_2": {"trainable": True, "lr": 1e-7},
-        "rb_3": {"trainable": True,  "lr": 1e-6}, 
-        "rb_4": {"trainable": True,  "lr": 1e-6}, 
-        "fc_1": {"trainable": True,  "lr": 1e-4}
+        "rb_3": {"trainable": True,  "lr": 5e-6}, 
+        "rb_4": {"trainable": True,  "lr": 5e-6}, 
+        "head": {"trainable": True,  "lr": 1e-4}
     }
 }
 
@@ -76,7 +77,7 @@ def build_flexible_optimizer(model, config):
     layer_config = config.get("layer_tuning", {})
     default_lr = config.get("learning_rate", 1e-5)
     
-    # Iterate through the top-level blocks of the model (conv, rb_0, fc_1, etc.)
+    # Iterate through the top-level blocks of the model (conv, rb_0, head, etc.)
     for name, child in model.named_children():
         
         # Get settings for this layer, or use defaults if not specified
@@ -307,7 +308,7 @@ class CustomDataset(Dataset):
             # 5. Time Cutout (Regularization)
             if np.random.rand() < AUG_CUTOUT_PROB:
                 # drop 10% to 20% of the signal in time
-                cutout_len = int(self.window_size * np.random.uniform(0.10, 0.20))
+                cutout_len = int(self.window_size * np.random.uniform(0.20, 0.30))
                 start_idx = np.random.randint(0, self.window_size - cutout_len)
                 window[:, start_idx : start_idx + cutout_len] = 0.0
 
@@ -449,8 +450,9 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     # Setup information about the class weights (class imbalace) for the focal loss
     class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
     #soft_weights = torch.tensor([0.70, 0.30], dtype=torch.float).to(DEVICE)
-    loss_fn = FocalLoss(weight=class_weights, gamma=1.0)
-    #loss_fn = nn.CrossEntropyLoss(weight=class_weights)
+    #loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
+    label_smoothing = CONFIG.get("label_smoothing", 0.0)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
     
     start_epoch = 0
     if resume_checkpoint and os.path.exists(resume_checkpoint):

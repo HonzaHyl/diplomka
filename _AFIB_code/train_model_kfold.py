@@ -25,6 +25,10 @@ if __name__ == '__main__':
     os.makedirs(os.path.join(run_dir, "model"), exist_ok=True)
     print(f"[INFO] Run directory created: {run_dir}")
     mlflow.start_run(run_name=run_name)
+    
+    # Change this note for each experiment so you don't get lost!
+    experiment_note = "Linear head, rb_0 to rb_4 trainable, label smoothing 0.1, weight decay 1e-3, global average pooling, no polarity flip, only AVGPOOL, increase LR, onecycleLR with 0.1 warm up"
+    mlflow.set_tag("experiment_note", experiment_note)
 
     print(f"[INFO] MLflow tracking URI: {mlflow.get_tracking_uri()}")
     print(f"[INFO] Experiment ID: {mlflow.get_experiment_by_name(experiment_name).experiment_id}")
@@ -40,7 +44,7 @@ if __name__ == '__main__':
         model_directory = sys.argv[2]
         resume_checkpoint = sys.argv[3] if len(sys.argv) == 4 else None
     else:
-        data_directory = "/mnt/mdpm/d03/jhyl/diplomka/finetune_data/SR_before/train"
+        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/finetune_data/SR_before/train"
         model_directory = os.path.join(run_dir, "model")
         # To resume training, set the resume_checkpoint path here:
         #resume_checkpoint = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Training_20260324_130349/model/checkpoint_epoch_96.pth"

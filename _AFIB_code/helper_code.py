@@ -223,6 +223,8 @@ def _load_model(model_directory,id, nOUT):
         # Manually delete the incompatible keys so PyTorch doesn't even see them
         state_dict.pop('fc_1.weight', None)
         state_dict.pop('fc_1.bias', None)
+        state_dict.pop('head.weight', None)
+        state_dict.pop('head.bias', None)
         model['classifier'].load_state_dict(state_dict, strict=False)
     model['classifier'].eval()
     model['thresholds'] = input['thresholds']
@@ -230,13 +232,18 @@ def _load_model(model_directory,id, nOUT):
     return model
 
 
-def finetune_model_prep(model):
+def finetune_model_prep(model, config=None):
     # Unfreeze all layers for full architecture finetuning
     for param in model.parameters():
         param.requires_grad = True
 
-    # Create new last layer with 2 output features
-    in_features = model.head.in_features
+    # Get the input features regardless of what kind of head was loaded
+    if isinstance(model.head, nn.Sequential):
+        in_features = model.head[0].in_features
+    else:
+        in_features = model.head.in_features
+
+    # Force the head to be a simple linear layer
     model.head = nn.Linear(in_features, 2)
     out_features = model.head.out_features
 

@@ -49,11 +49,11 @@ class NN(nn.Module):
         self.rb_3 = MyResidualBlock(downsample=True)
         self.rb_4 = MyResidualBlock(downsample=True)
 
-        self.pool_max = nn.AdaptiveMaxPool1d(output_size=1)
         self.pool_avg = nn.AdaptiveAvgPool1d(output_size=1)
+        self.pool_max = nn.AdaptiveMaxPool1d(output_size=1)
 
-        # Simple linear classification head
-        self.head = nn.Linear(256 + 256 + 12, nOUT)
+        # Simple linear classification head: 256 (avg) + 256 (max) + 12 (leads)
+        self.head = nn.Linear(256 * 2 + 12, nOUT)
 
     def forward(self, x, l):
         x = F.leaky_relu(self.bn(self.conv(x)))
@@ -68,12 +68,31 @@ class NN(nn.Module):
         x = F.dropout2d(x, p=0.5, training=self.training)
         x = x.squeeze(2)
         
-        # Apply both poolings to capture peak and global activations
-        x_max = self.pool_max(x).squeeze(2) # Shape: [Batch, 256]
+        # Apply average pooling to capture global statistics (general rhythm, RMS)
         x_avg = self.pool_avg(x).squeeze(2) # Shape: [Batch, 256]
-        
-        # Concatenate: peak features + global features + lead mask
-        x = torch.cat((x_max, x_avg, l), dim=1)  # [Batch, 524]
+
+        # Apply max pooling to capture presence of specific morphological features (like P-waves)
+        x_max = self.pool_max(x).squeeze(2) # Shape: [Batch, 256]
+
+        # Concatenate: global features + max features + lead mask
+        x = torch.cat((x_avg, x_max, l), dim=1)  # [Batch, 524]
         x = self.head(x)
         
         return x
+
+class EnsembleNN(nn.Module):
+    def __init__(self, nOUT, num_models=4):
+        super(EnsembleNN, self).__init__()
+        self.models = nn.ModuleList([NN(nOUT=nOUT) for _ in range(num_models)])
+        
+    def forward(self, x, l):
+        # Get probabilities from all models
+        probs = [torch.softmax(model(x, l), dim=1) for model in self.models]
+        # Average probabilities
+        avg_probs = torch.stack(probs, dim=0).mean(dim=0)
+        
+        # Return log probabilities so that applying softmax later 
+        # (as in test_model.py) recovers the averaged probabilities: softmax(log(p)) = p
+        epsilon = 1e-8
+        log_probs = torch.log(avg_probs + epsilon)
+        return log_probs

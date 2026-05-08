@@ -9,7 +9,7 @@ import argparse
 
 def plot_cv_metrics():
     parser = argparse.ArgumentParser(description="Plot CV Metrics")
-    parser.add_argument("--tracking_uri", default="sqlite:////mnt/mdpm/d03/jhyl/deepstem_results/mlflow_runs.db")
+    parser.add_argument("--tracking_uri", default="sqlite:////mnt/mdpm/d03/jhyl/diplomka/_AFIB_code/mlflow.db")
     parser.add_argument("--output_dir", default="/srv/home/jhyl/Afib_recurrence/diplomka/results")
     parser.add_argument("--latest", action="store_true", help="Use the latest CV run automatically")
     args = parser.parse_args()
@@ -126,8 +126,20 @@ def plot_cv_metrics():
         
     df = pd.DataFrame(records)
     
-    # Compute aggregates (mean, std, count) grouped by metric and step (epoch)
-    agg_df = df.groupby(["metric", "step"])['value'].agg(['mean', 'std', 'count']).reset_index()
+    # --- FORWARD FILLING LOGIC ---
+    # 1. Pivot the table so each fold is a column and each step is a row
+    pivot_df = df.pivot_table(index=["metric", "step"], columns="fold", values="value")
+    
+    # 2. Forward-fill the missing values for folds that stopped early
+    # (Grouping by metric first ensures we don't bleed loss into AUROC)
+    pivot_df = pivot_df.groupby(level="metric").ffill()
+    
+    # 3. Melt it back into a long format for easy aggregation
+    filled_df = pivot_df.reset_index().melt(id_vars=["metric", "step"], value_name="value").dropna()
+    
+    # 4. Compute aggregates on the filled data
+    agg_df = filled_df.groupby(["metric", "step"])['value'].agg(['mean', 'std', 'count']).reset_index()
+    # -----------------------------
     
     specific_output_dir = os.path.join(output_dir, selected_group.get('p_name', 'Unnamed_CV_Run'))
     os.makedirs(specific_output_dir, exist_ok=True)
@@ -139,7 +151,7 @@ def plot_cv_metrics():
         if data.empty: continue
         steps = data["step"]
         means = data["mean"]
-        # Use fillna(0) for std if there is only 1 fold for that step
+        # Use fillna(0) for std if there is only 1 fold for that step (handled safely)
         stds = data["std"].fillna(0)
         
         plt.plot(steps, means, marker='o', color=color, label=label)
@@ -178,7 +190,7 @@ def plot_cv_metrics():
     plt.close()
     
     print(f"Plots successfully generated and saved to {specific_output_dir}")
-    print("\nAggregate Statistics at Final Extracted Epoch:")
+    print("\nAggregate Statistics at Final Extracted Epoch (Including Early Stopping carry-over):")
     max_step = agg_df['step'].max()
     final_stats = agg_df[agg_df['step'] == max_step]
     print(final_stats.to_string(index=False))

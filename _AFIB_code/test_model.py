@@ -14,27 +14,34 @@ import datetime
 
 from device_selector import DeviceSelector
 
-from model_structure import NN
+from model_structure import NN, EnsembleNN
 
 selector = DeviceSelector()
 DEVICE = selector.select(1)[0]
 
-from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, accuracy_score, f1_score, confusion_matrix, balanced_accuracy_score
 
 MODEL_ID = "finetuned"
 
-def test_model(model_dir, test_data_dir, output_dir):
+def test_model(model_path, test_data_dir, output_dir):
 
     # Load .hea of test data
     print('Finding header and recording files...')
     header_files = find_header_files(test_data_dir)
 
-    # Load model
-    # Load the best checkpoint from your resumed training run
-    checkpoint_path = os.path.join(model_dir, "checkpoint_epoch_104.pth")  # You can adjust this file name
-
-    model = NN(nOUT=2).to(DEVICE)
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    # Load model
+    print(f'Loading model from {model_path}...')
+    # Check if the checkpoint is an ensemble
+    checkpoint = torch.load(model_path, map_location=DEVICE)
+    
+    if checkpoint.get('is_ensemble', False):
+        num_models = checkpoint.get('num_models', 4)
+        print(f"Loading Ensemble model with {num_models} sub-models...")
+        model = EnsembleNN(nOUT=2, num_models=num_models).to(DEVICE)
+    else:
+        print("Loading standard single NN model...")
+        model = NN(nOUT=2).to(DEVICE)
+        
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
@@ -52,26 +59,46 @@ def test_model(model_dir, test_data_dir, output_dir):
  
     # Preprocess recording and run inference
     for header_path in header_files:
-        # Path to recording file
-        recording_path = header_path.replace(".hea", ".mat")
-        filename, extension = os.path.splitext(recording_path)
-        filename = filename.split("/")[-1]
+        recording_path_mat = header_path.replace(".hea", ".mat")
+        recording_path_npy = header_path.replace(".hea", ".npy")
+        filename = os.path.basename(header_path).replace(".hea", "")
 
-        # Load recording
-        recording = load_recording(recording_path)
-        
-        # Get info from header
+        # Get info from header
         header = load_header(header_path)
         leads = get_leads(header)
         fs = get_frequency(header)
+        
+        # The dataset has Healthy = 1, Recurrence = 0.
+        # Keeping it exactly as it is.
         label = int(get_labels(header)[0])
 
-        # Expand recording to 12 leads
-        recording, lead_indicator = expand_leads(recording, leads)
-        lead_indicator = torch.tensor(lead_indicator, dtype=torch.float32)
-        lead_indicator = lead_indicator.unsqueeze(0)
-        # Preprocess recording (filters, downsampling, standardization)
-        recording = preprocessing(recording, fs)
+        # Check if preprocessed .npy file exists
+        if os.path.exists(recording_path_npy):
+            recording = np.load(recording_path_npy)
+            
+            # Expand leads to get the lead_indicator 
+            # (assuming the .npy itself already has 12 rows, we just need the indicator)
+            _, lead_indicator = expand_leads(np.zeros((12, 1)), leads)
+            lead_indicator = torch.tensor(lead_indicator, dtype=torch.float32).unsqueeze(0)
+            
+            # .npy is already preprocessed. Ensure it's the right tensor shape.
+            tensor_data = torch.tensor(recording, dtype=torch.float32)
+            if len(tensor_data.shape) == 2:
+                tensor_data = tensor_data.unsqueeze(0).unsqueeze(2)
+            elif len(tensor_data.shape) == 3:
+                tensor_data = tensor_data.unsqueeze(2)
+            recording = tensor_data
+        else:
+            # Load .mat recording
+            recording = load_recording(recording_path_mat)
+            
+            # Expand recording to 12 leads
+            recording, lead_indicator = expand_leads(recording, leads)
+            lead_indicator = torch.tensor(lead_indicator, dtype=torch.float32).unsqueeze(0)
+            
+            # Preprocess recording (filters, downsampling, standardization)
+            recording = preprocessing(recording, fs)
+
         # Infer recordings using sliding windows (matching validation!)
         recording = recording.to(DEVICE)
         sig_len = recording.shape[-1]
@@ -98,11 +125,16 @@ def test_model(model_dir, test_data_dir, output_dir):
             p = torch.softmax(y, dim=1)
         
         # Patient-level prediction (Mean across windows)
-        mean_prob_positive = p[:, 1].mean().item()
-        prob_negative = 1.0 - mean_prob_positive
-        patient_p = np.array([[prob_negative, mean_prob_positive]])
+        # The model was trained with Healthy = 1, Recurrence = 0.
+        # So p[:, 1] is the probability of Healthy (the positive class).
+        prob_recurrence = p[:, 0].mean().item()
+        prob_healthy = p[:, 1].mean().item()
+        patient_p = np.array([[prob_recurrence, prob_healthy]])
         
-        temp_dict["softmax_probas"][filename] = patient_p.tolist()
+        temp_dict["softmax_probas"][filename] = {
+            "probabilities": patient_p.tolist()[0],
+            "ground_truth": label
+        }
 
         outputs.append(patient_p)
         targets.append(label)
@@ -113,18 +145,27 @@ def test_model(model_dir, test_data_dir, output_dir):
 
 
     positive_class_probs = outputs[:, 1]
+    targets_np = np.array(targets)
 
-    temp_dict["auprc"] = float(average_precision_score(y_true=targets, y_score=positive_class_probs))
-    temp_dict["auroc"] = float(roc_auc_score(y_true=targets, y_score=positive_class_probs))
+    # AUPRC is highly sensitive to class imbalance. 
+    # We calculate it for both the Healthy class (1) and Recurrence class (0).
+    temp_dict["auprc_healthy"] = float(average_precision_score(y_true=targets_np, y_score=outputs[:, 1]))
+    temp_dict["auprc_recurrence"] = float(average_precision_score(y_true=1-targets_np, y_score=outputs[:, 0]))
+    
+    # AUROC is symmetric, so one is enough
+    temp_dict["auroc"] = float(roc_auc_score(y_true=targets_np, y_score=positive_class_probs))
 
-    y_pred = (positive_class_probs >= 0.6).astype(int)
+    y_pred = (positive_class_probs >= 0.5).astype(int)
 
-    temp_dict["confusion_matrix"] = confusion_matrix(targets, y_pred).tolist()
+    temp_dict["confusion_matrix"] = confusion_matrix(targets_np, y_pred).tolist()
 
-    temp_dict["f1"] = float(f1_score(targets, y_pred))
-    temp_dict["precision"] = float(precision_score(targets, y_pred))
-    temp_dict["recall"] = float(recall_score(targets, y_pred))
-    temp_dict["accuracy"] = float(accuracy_score(targets, y_pred))
+    # Macro averages treat both classes equally, preventing the majority class from dominating the score.
+    temp_dict["f1_macro"] = float(f1_score(targets_np, y_pred, average="macro"))
+    temp_dict["precision_macro"] = float(precision_score(targets_np, y_pred, average="macro", zero_division=0))
+    temp_dict["recall_macro"] = float(recall_score(targets_np, y_pred, average="macro"))
+    
+    temp_dict["accuracy"] = float(accuracy_score(targets_np, y_pred))
+    temp_dict["balanced_accuracy"] = float(balanced_accuracy_score(targets_np, y_pred))
 
     output_file_path = os.path.join(output_dir, "model_"+MODEL_ID+".yaml")
 
@@ -188,16 +229,16 @@ if __name__ == '__main__':
     if USE_ARG == True:
         # Parse arguments.
         if len(sys.argv) != 4:
-            raise Exception('Include the model, data, and output folders as arguments, e.g., python test_model.py model data outputs.')
+            raise Exception('Include the model path, data folder, and output folder as arguments, e.g., python test_model.py model.pth data outputs.')
 
-        model_directory = sys.argv[1]
+        model_path = sys.argv[1]
         data_directory = sys.argv[2]
         output_directory = sys.argv[3]
     else:
-        model_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Training_20260324_140945/model"
-        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/test_data"
+        model_path = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Trial_45/ensemble_model.pth"
+        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/finetune_data/SR_before/test"
         output_directory = os.path.join(run_dir, "test_outputs")
 
     print('Starting main script...', flush=True)
-    test_model(model_directory, data_directory, output_directory)
+    test_model(model_path, data_directory, output_directory)
     print('Done.', flush=True)

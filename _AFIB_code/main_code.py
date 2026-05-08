@@ -13,6 +13,10 @@ import copy
 import pickle
 import warnings
 import mlflow
+try:
+    import optuna
+except ImportError:
+    optuna = None
 
 from model_structure import NN
 
@@ -49,41 +53,52 @@ torch.backends.cudnn.benchmark     = False
 WINDOW_SIZE = 4992 # 10 seconds (Multiple of 64) 15040 4992
 STEP_SIZE   = 2496  # 5 second stride 10048 2496
 
+# ── Optuna Trial Pruning ─────────────────────────────────────────────────────
+# If valid_loss / train_loss exceeds this ratio at ANY epoch (incl. warmup),
+# the trial's hyperparameters are structurally bad → prune the entire trial.
+# Keep at ~3.0: a ratio of 2x is expected in small datasets, 3x+ means
+# the LR or weight-decay combination is actively blowing up generalisation.
+PRUNE_LOSS_RATIO = 3.0
+# ─────────────────────────────────────────────────────────────────────────────
+
 CONFIG = {
-    "learning_rate": 1e-4,
     "LR_scheduler": "OneCycleLR",
-    "pct_start": 0.3, 
+    "pct_start": 0.15, 
     "anneal_strategy": "cos",
     "optimizer": "AdamW",
-    "weight_decay": 1e-3,
-    "epochs": 30,
-    "label_smoothing": 0.1,  # Added label smoothing
+    "epochs": 20,
+    "batch_size": 512,
     
     # Layers to train
     "layer_tuning": {
-        "conv": {"trainable": False, "lr": 1e-7},
-        "bn":   {"trainable": False, "lr": 1e-7},
-        "rb_0": {"trainable": False, "lr": 1e-7},
-        "rb_1": {"trainable": True, "lr": 1e-7},
-        "rb_2": {"trainable": True, "lr": 1e-7},
-        "rb_3": {"trainable": True,  "lr": 5e-6}, 
-        "rb_4": {"trainable": True,  "lr": 5e-6}, 
-        "head": {"trainable": True,  "lr": 1e-4}
+        "conv": {"trainable": False, "lr": 0, "weight_decay": 0},
+        "bn":   {"trainable": False, "lr": 0, "weight_decay": 0},
+        "rb_0": {"trainable": True, "lr": 1e-6, "weight_decay": 1e-3},
+        "rb_1": {"trainable": True, "lr": 1e-6, "weight_decay": 1e-3},
+        "rb_2": {"trainable": True, "lr": 1e-6, "weight_decay": 1e-3},
+        "rb_3": {"trainable": True, "lr": 1e-5, "weight_decay": 1e-3}, 
+        "rb_4": {"trainable": True, "lr": 1e-5, "weight_decay": 1e-3}, 
+        "head": {"trainable": True,  "lr": 1e-4, "weight_decay": 1e-2}
     }
 }
 
 def build_flexible_optimizer(model, config):
     param_groups = []
     layer_config = config.get("layer_tuning", {})
-    default_lr = config.get("learning_rate", 1e-5)
+    default_lr = 1e-5
+    default_wd = 1e-3
     
     # Iterate through the top-level blocks of the model (conv, rb_0, head, etc.)
     for name, child in model.named_children():
+        # Skip layers that have no parameters (like max pool, avg pool, dropout)
+        if len(list(child.parameters())) == 0:
+            continue
         
         # Get settings for this layer, or use defaults if not specified
         settings = layer_config.get(name, {"trainable": True, "lr": default_lr})
-        is_trainable = settings["trainable"]
-        lr = settings["lr"]
+        is_trainable = settings.get("trainable", True)
+        lr = settings.get("lr", default_lr)
+        wd = settings.get("weight_decay", default_wd)
         
         # 1. Turn the layer on or off
         for param in child.parameters():
@@ -94,17 +109,21 @@ def build_flexible_optimizer(model, config):
             param_groups.append({
                 'params': filter(lambda p: p.requires_grad, child.parameters()),
                 'lr': lr,
+                'weight_decay': wd,
                 'name': name # Helpful for debugging later if needed
             })
             
     # Build and return the optimizer
-    optimizer = optim.AdamW(param_groups, weight_decay=config["weight_decay"])
+    optimizer = optim.AdamW(param_groups, weight_decay=default_wd)
     
     # Optional: Print a summary so you know exactly what is happening
     print("\n--- Layer Tuning Summary ---")
     for name, child in model.named_children():
-        status = "🟢 Trainable" if layer_config.get(name, {}).get("trainable", True) else "🔴 Frozen"
-        print(f"{name.ljust(10)}: {status} | LR: {layer_config.get(name, {}).get('lr', default_lr)}")
+        if len(list(child.parameters())) == 0:
+            continue
+        settings = layer_config.get(name, {})
+        status = "🟢 Trainable" if settings.get("trainable", True) else "🔴 Frozen"
+        print(f"{name.ljust(10)}: {status} | LR: {settings.get('lr', default_lr)} | WD: {settings.get('weight_decay', default_wd)}")
     print("----------------------------\n")
             
     return optimizer
@@ -218,7 +237,7 @@ class CustomDataset(Dataset):
         train = CustomDataset(header_paths=x_train[:,0].tolist())
         train.is_train=True
         train.num_leads=None
-        train._add_flipped_windows()  # doubles the training set via polarity flip
+        #train._add_flipped_windows()  # doubles the training set via polarity flip
 
         valid = CustomDataset(header_paths=x_valid[:,0].tolist())
         valid.is_train=False
@@ -248,7 +267,7 @@ class CustomDataset(Dataset):
             train_dataset = CustomDataset(header_paths=train_headers)
             train_dataset.is_train = True
             train_dataset.num_leads = None
-            train_dataset._add_flipped_windows()  # doubles the training set via polarity flip
+            #źtrain_dataset._add_flipped_windows()  # doubles the training set via polarity flip
 
             # Create validation dataset instance
             valid_dataset = CustomDataset(header_paths=valid_headers)
@@ -292,9 +311,9 @@ class CustomDataset(Dataset):
             if flipped:
                 window = -window
 
-            # 2. Mild amplitude augmentation (random scale ±15%)
-            amp_scale = np.random.uniform(AUG_AMP_MIN, AUG_AMP_MAX)
-            window = window * amp_scale
+            # 2. Mild amplitude augmentation (random scale ±15%) - DISABLED to preserve RMS voltage
+            # amp_scale = np.random.uniform(AUG_AMP_MIN, AUG_AMP_MAX)
+            # window = window * amp_scale
 
             # 3. Very mild Gaussian noise — σ kept well below P-wave amplitude
             noise = np.random.normal(0.0, AUG_NOISE_STD, size=window.shape).astype(np.float32)
@@ -331,10 +350,10 @@ class CustomDataset(Dataset):
             return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
         
 
-def training_code(data_directory, model_directory, resume_checkpoint=None):
-    _training_code(data_directory, model_directory, "finetuned", resume_checkpoint)
+def training_code(data_directory, model_directory, resume_checkpoint=None, config=None, device=None):
+    return _training_code(data_directory, model_directory, "finetuned", resume_checkpoint, config=config, device=device)
 
-def training_code_kfold(data_directory, model_directory, k_folds=4, resume_checkpoint=None):
+def training_code_kfold(data_directory, model_directory, k_folds=4, resume_checkpoint=None, config=None, device=None, trial=None):
     print(f"Finding header and recording files for {k_folds}-Fold Cross-Validation...")
     header_files = find_header_files(data_directory)
     full_dataset = CustomDataset(header_files)
@@ -342,6 +361,7 @@ def training_code_kfold(data_directory, model_directory, k_folds=4, resume_check
     # Get K folds
     folds = full_dataset.get_kfold_splits(n_splits=k_folds)
     
+    fold_aurocs = []
     # Train separate models iteratively
     for fold_idx, (train_ds, valid_ds) in enumerate(folds):
         print(f"\n" + "="*20 + f" FOLD {fold_idx + 1}/{k_folds} " + "="*20)
@@ -352,9 +372,17 @@ def training_code_kfold(data_directory, model_directory, k_folds=4, resume_check
         # Use nested MLflow runs to keep the dashboard organized
         with mlflow.start_run(run_name=f"Fold_{fold_idx+1}", nested=True):
             # Pass the pre-split datasets instead of data_directory
-            _training_code((train_ds, valid_ds), fold_model_dir, f"fold_{fold_idx+1}", resume_checkpoint)
+            best_auroc, train_at_best = _training_code((train_ds, valid_ds), fold_model_dir, f"fold_{fold_idx+1}", resume_checkpoint, config=config, device=device, trial=trial, fold_idx=fold_idx)
+            fold_aurocs.append((best_auroc, train_at_best))
+    
+    return fold_aurocs
 
-def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, resume_checkpoint=None):
+def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, resume_checkpoint=None, config=None, device=None, trial=None, fold_idx=0):
+    if config is None:
+        config = CONFIG
+    
+    if device is None:
+        device = DEVICE
     # === TensorBoard setup ===
     log_dir = os.path.join(model_directory, "runs", f"ensamble_{ensamble_ID}_{int(time.time())}")
     writer = SummaryWriter(log_dir=log_dir)
@@ -420,7 +448,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
     _train_gen.manual_seed(SEED)
 
     train = DataLoader(dataset=train,
-                       batch_size=256,
+                       batch_size=config.get("batch_size", 128),
                        shuffle=True,  # Added shuffle=True since sampler is disabled
                        num_workers=8,
                        collate_fn=collate_fn,
@@ -439,81 +467,110 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
 
     loaded_model = _load_model(".", 1, nOUT=26)
     classifier = loaded_model["classifier"]
-    prep_m = finetune_model_prep(classifier)
-    model = prep_m.to(DEVICE)
+    prep_m = finetune_model_prep(classifier, config=config)
+    model = prep_m.to(device)
+    
+    # Log the exact model architecture for this run
+    mlflow.log_text(str(model), "model_architecture.txt")
 
     # Use .dataset since train is now a DataLoader
     class_counts = train.dataset.summary(output='numpy')
     weights = 1.0 / class_counts 
     weights = weights / weights.sum() 
     
-    # Setup information about the class weights (class imbalace) for the focal loss
-    class_weights = torch.tensor(weights, dtype=torch.float).to(DEVICE)
-    #soft_weights = torch.tensor([0.70, 0.30], dtype=torch.float).to(DEVICE)
-    #loss_fn = FocalLoss(weight=class_weights, gamma=2.0)
-    label_smoothing = CONFIG.get("label_smoothing", 0.0)
-    loss_fn = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=label_smoothing)
-    
+    # Setup information about the class weights (class imbalance) for the loss
+    class_weights = torch.tensor(weights, dtype=torch.float).to(device)
+    loss_fn = nn.CrossEntropyLoss(weight=class_weights)
     start_epoch = 0
     if resume_checkpoint and os.path.exists(resume_checkpoint):
         print(f"Loading checkpoint '{resume_checkpoint}'")
-        checkpoint = torch.load(resume_checkpoint, map_location=DEVICE)
+        checkpoint = torch.load(resume_checkpoint, map_location=device)
         start_epoch = checkpoint['epoch'] + 1
         
-        opt = build_flexible_optimizer(model, CONFIG)
+        opt = build_flexible_optimizer(model, config)
         model.load_state_dict(checkpoint['model_state_dict'])
         # opt.load_state_dict(checkpoint['optimizer_state_dict']) # <-- TEMPORARILY DISABLED: We want a fresh Learning Rate!
         
-        steps_per_epoch = len(train)
-        max_lrs = [group['lr'] for group in opt.param_groups]
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=max_lrs,
-            steps_per_epoch=steps_per_epoch,
-            epochs=CONFIG["epochs"] - start_epoch,
-            pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
-            cycle_momentum=False
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            opt, 
+            mode='min', 
+            factor=0.5, 
+            patience=2
         )
         # scheduler.load_state_dict(checkpoint['scheduler_state_dict']) # <-- TEMPORARILY DISABLED: Restart the schedule!
         print(f"Loaded checkpoint '{resume_checkpoint}' (resuming from epoch {start_epoch})")
     else:
-        opt = build_flexible_optimizer(model, CONFIG)
-        steps_per_epoch = len(train)
-        max_lrs = [group['lr'] for group in opt.param_groups]
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            opt,
-            max_lr=max_lrs,
-            steps_per_epoch=steps_per_epoch,
-            epochs=CONFIG["epochs"],
-            pct_start=CONFIG.get("pct_start", 0.1),
-            anneal_strategy=CONFIG.get("anneal_strategy", "cos"),
-            cycle_momentum=False
+        opt = build_flexible_optimizer(model, config)
+        # Use ReduceLROnPlateau for the main training phase
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            opt, 
+            mode='min', 
+            factor=0.5, 
+            patience=2
         )
+        
+    # Store initial target LRs for warmup
+    target_lrs = [group['lr'] for group in opt.param_groups]
+    warmup_epochs = 3
     
-    mlflow.log_params(CONFIG)
+    mlflow.log_params(config)
 
     OUTPUT = []
-    EPOCHS = CONFIG["epochs"]
+    EPOCHS = config["epochs"]
+    best_valid_auroc = 0.0
+    train_auroc_at_best = 0.0
+    min_valid_loss = float('inf')
+
+    min_valid_loss = float('inf')
+    patience = 5  # Stop if loss doesn't improve for 5 epochs
+    patience_counter = 0
+
     for epoch in range(start_epoch, EPOCHS):
         print(f"============================[{epoch}]============================")
         
-        # Unpack the new train loss
-        train_loss, train_auprc, train_auroc, train_f1, train_cm = train_part(model, train, opt, loss_fn, scheduler=scheduler)
+        # --- HYBRID SCHEDULER: Manual Linear Warmup ---
+        if epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            for i, group in enumerate(opt.param_groups):
+                group['lr'] = target_lrs[i] * warmup_factor
+            print(f"Warm-up Phase: Scaling LR to {warmup_factor*100:.1f}% of target.")
+        
+        # Unpack the new train loss (Removed batch-level scheduler step)
+        train_loss, train_auprc, train_auroc, train_f1, train_cm = train_part(model, train, opt, loss_fn, device, scheduler=None)
         print(f"Train | Loss: {train_loss:.4f} | AUPRC: {train_auprc:.4f} | AUROC: {train_auroc:.4f} | F1: {train_f1:.4f}")
         
         # Pass loss_fn to validation and unpack the new valid loss
-        valid_loss, valid_auprc, valid_auroc, valid_f1, valid_cm, valid_targets, valid_outputs, best_threshold = valid_part(model, valid, loss_fn)
+        valid_loss, valid_auprc, valid_auroc, valid_f1, valid_cm, valid_targets, valid_outputs, best_threshold = valid_part(model, valid, loss_fn, device)
+        
+        if valid_auroc > best_valid_auroc:
+            best_valid_auroc = valid_auroc
+            train_auroc_at_best = train_auroc
+            
         print(f"Valid | Loss: {valid_loss:.4f} | AUPRC: {valid_auprc:.4f} | AUROC: {valid_auroc:.4f} | F1: {valid_f1:.4f}")
         print(f"Valid Confusion Matrix:\n{valid_cm}")
-
+        
         tn, fp, fn, tp = valid_cm.ravel()
-        current_lr = scheduler.get_last_lr()[0]
+        loss_ratio = valid_loss / (train_loss + 1e-8)
+        print(f"Valid/Train Loss Ratio: {loss_ratio:.2f}")
 
-        # MLflow Logging (Add the losses here)
+        # ── TIER-1: TRIAL PRUNING (bad hyperparameters — kills entire Optuna trial) ──
+        # Active at EVERY epoch, including warmup, so extreme early overfitting is caught.
+        # A high valid/train loss ratio means the LR / weight-decay combination is
+        # structurally wrong, not just fold-level noise → no point running remaining folds.
+        if trial is not None and optuna is not None and loss_ratio > PRUNE_LOSS_RATIO:
+            phase = "warm-up" if epoch < warmup_epochs else "post-warmup"
+            print(f"[TRIAL PRUNED] ({phase} epoch {epoch}) "
+                  f"Valid/Train loss ratio {loss_ratio:.2f} > {PRUNE_LOSS_RATIO}. "
+                  f"Hyperparameters are structurally bad — skipping remaining folds.")
+            mlflow.set_tag("pruned_reason", f"loss_ratio={loss_ratio:.2f} at epoch {epoch} ({phase})")
+            raise optuna.exceptions.TrialPruned()
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        # MLflow Logging
         mlflow.log_metrics({
-            'train_loss': train_loss,   # <-- NEW
-            'valid_loss': valid_loss,   # <-- NEW
+            'train_loss': train_loss,
+            'valid_loss': valid_loss,
+            'loss_ratio': loss_ratio,
             'train_auprc': train_auprc,
             'train_auroc': train_auroc,
             'train_f1': train_f1,
@@ -523,24 +580,62 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             'valid_tn': tn,
             'valid_fp': fp,
             'valid_fn': fn,
-            'valid_tp': tp,
-            'learning_rate': current_lr
+            'valid_tp': tp
         }, step=epoch)
 
         checkpoint_filename = f"checkpoint_epoch_{epoch}.pth"
         checkpoint_path = os.path.join(model_directory, checkpoint_filename)
         
-        # 2. Save full state to allow for resuming training
+        # Save full state to allow for resuming training
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': opt.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'valid_auroc': valid_auroc # Optional: handy to know how good this epoch was
+            'valid_auroc': valid_auroc
         }, checkpoint_path)
         
-        # 3. Log the file to MLflow under a "checkpoints" folder
+        # Log the checkpoint to MLflow
         mlflow.log_artifact(local_path=checkpoint_path, artifact_path="checkpoints")
+        
+        # ── TIER-2: FOLD EARLY STOPPING (overfitting on this fold — break only) ──
+        # Fires only when BOTH conditions hold simultaneously (post-warmup):
+        #   1. valid_loss > train_loss  (model has crossed into overfitting territory)
+        #   2. valid_loss is not improving  (it's plateaued / climbing, not recovering)
+        # If valid_loss is still below train_loss the model is fine; reset the counter.
+        if valid_loss < min_valid_loss:
+            min_valid_loss = valid_loss
+            patience_counter = 0
+            
+            # Save the 'best' model weights right now, before overfitting starts
+            best_model_path = os.path.join(model_directory, "best_loss_weights.pth")
+            torch.save(model.state_dict(), best_model_path)
+            mlflow.log_artifact(local_path=best_model_path, artifact_path="model")
+        else:
+            # Only count patience post-warmup AND when valid has crossed above train
+            if epoch >= warmup_epochs and valid_loss > train_loss:
+                patience_counter += 1
+                print(f"Valid loss above train loss and not improving. "
+                      f"Patience: {patience_counter}/{patience}")
+            elif epoch >= warmup_epochs:
+                # Valid loss is not improving but still below train — reset, keep training
+                print(f"Valid loss not improving but still below train loss "
+                      f"({valid_loss:.4f} <= {train_loss:.4f}). Patience counter reset.")
+                patience_counter = 0
+            else:
+                print("Warm-up phase: Patience counter paused.")
+        # ─────────────────────────────────────────────────────────────────────────────
+            
+        # --- HYBRID SCHEDULER: Plateau Step ---
+        if epoch >= warmup_epochs:
+            scheduler.step(valid_loss)
+
+        # CHECK: Has patience run out? (fold early stop — not a trial prune)
+        if patience_counter >= patience:
+            print(f"FOLD EARLY STOPPED: Validation loss has not improved for {patience} epochs. "
+                  f"(Remaining folds will still run.)")
+            break
+
         
     writer.close()
     
@@ -551,18 +646,20 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
         pickle.dump(valid_files, handle, protocol=pickle.HIGHEST_PROTOCOL)
         pickle.dump(class_weights, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
+    return best_valid_auroc, train_auroc_at_best
 
 
-def train_part(model, dataset, opt, loss_fn, scheduler=None):
+
+def train_part(model, dataset, opt, loss_fn, device, scheduler=None):
     from torchmetrics.classification import (
         BinaryAUROC, BinaryAveragePrecision, BinaryF1Score, BinaryConfusionMatrix
     )
 
-    # Initialize torchmetrics metrics and move them to DEVICE
-    metric_auroc = BinaryAUROC().to(DEVICE)
-    metric_auprc = BinaryAveragePrecision().to(DEVICE)
-    metric_f1    = BinaryF1Score().to(DEVICE)
-    metric_cm    = BinaryConfusionMatrix().to(DEVICE)
+    # Initialize torchmetrics metrics and move them to device
+    metric_auroc = BinaryAUROC().to(device)
+    metric_auprc = BinaryAveragePrecision().to(device)
+    metric_f1    = BinaryF1Score().to(device)
+    metric_cm    = BinaryConfusionMatrix().to(device)
 
     total_loss = 0.0
     num_batches = 0
@@ -583,9 +680,9 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
     for (x, t, l) in dataset:
         opt.zero_grad()
 
-        x = x.unsqueeze(2).float().to(DEVICE)
-        t = t.to(DEVICE)
-        l = l.float().to(DEVICE)
+        x = x.unsqueeze(2).float().to(device)
+        t = t.to(device)
+        l = l.float().to(device)
 
         y = model(x, l)
         t_indices = torch.argmax(t, dim=1)
@@ -598,9 +695,7 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
         opt.step()
-        if scheduler is not None:
-            scheduler.step()
-
+        
         # Update torchmetrics: remap so that 1 = recurrence (positive class)
         with torch.no_grad():
             p = torch.softmax(y, dim=1)
@@ -628,7 +723,7 @@ def train_part(model, dataset, opt, loss_fn, scheduler=None):
     return avg_train_loss, auprc, auroc, f1, cm
 
 
-def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
+def valid_part(model, dataset, loss_fn, device): # <-- Added loss_fn
     targets = []
     outputs = []
     total_loss = 0.0 # <-- Initialize loss tracking
@@ -653,11 +748,11 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
             if len(windows) == 0:
                 windows.append(x[:, :, -window_size:])
                 
-            windows_tensor = torch.cat(windows, dim=0).to(DEVICE)
+            windows_tensor = torch.cat(windows, dim=0).to(device)
             windows_tensor = windows_tensor.unsqueeze(2)
 
-            t = t.to(DEVICE)
-            l = l.float().to(DEVICE)
+            t = t.to(device)
+            l = l.float().to(device)
             l_expanded = l.expand(windows_tensor.shape[0], -1)
             
             # Get raw logits for all windows: [num_windows, 2]
@@ -666,12 +761,10 @@ def valid_part(model, dataset, loss_fn): # <-- Added loss_fn
             # Convert each window's logits to probabilities FIRST
             window_probs = torch.softmax(y, dim=1)
             
-            # Patient-level prediction: Top-K Average Pooling on probabilities
-            # This isolates the most suspicious windows without being completely 
-            # derailed by a single noise artifact, while avoiding dilution.
-            k = min(3, window_probs.shape[0])
-            topk_probs = torch.topk(window_probs, k=k, dim=0)[0]    # [k, 2]
-            patient_p = topk_probs.mean(dim=0, keepdim=True)        # [1, 2]
+            # Patient-level prediction: Global Average Pooling on probabilities
+            # This ensures that structural changes are consistent across the entire recording
+            # and prevents a few highly-confident noise artifacts from dominating the prediction.
+            patient_p = window_probs.mean(dim=0, keepdim=True)      # [1, 2]
             
             # True validation loss: FocalLoss expects logits. We can safely pass log(p)
             # because FocalLoss internally applies log_softmax, and log_softmax(log(p)) = log(p).

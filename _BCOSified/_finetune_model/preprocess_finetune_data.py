@@ -17,10 +17,21 @@ def preprocess_folder(input_dir, output_dir):
     print(f"Processing {len(header_files)} files from {input_dir}...")
 
     for h_file in tqdm(header_files):
+        file_id = os.path.basename(h_file).replace(".hea", ".npy")
+        output_path = os.path.join(output_dir, file_id)
+        
+        # Resume option: skip if already processed
+        if os.path.exists(output_path):
+            continue
+            
         # 1. Load raw data
         header = load_header(h_file)
-        fs = get_frequency(header)
-        recording = load_recording(h_file.replace(".hea", ".mat"))
+        try:
+            fs = get_frequency(header)
+            recording = load_recording(h_file.replace(".hea", ".mat"))
+        except Exception as e:
+            print(f"Failed to load {h_file}: {e}. Skipping...")
+            continue
         
         # 2. Standardize leads to 12 leads
         leads = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
@@ -46,10 +57,8 @@ def preprocess_folder(input_dir, output_dir):
         data_np = data.astype(np.float32)
 
         # 6. Save as .npy
-        file_id = os.path.basename(h_file).replace(".hea", ".npy")
-        np.save(os.path.join(output_dir, file_id), data_np)
+        np.save(output_path, data_np)
 
 if __name__=="__main__":
     # Run for both folders
-    preprocess_folder("/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/train_data", "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/train_data")
-    preprocess_folder("/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/test_data", "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/test_data")
+    preprocess_folder("/srv/home/jhyl/Afib_recurrence/finetune_data_all", "/srv/home/jhyl/Afib_recurrence/finetune_data_all_preprocessed")

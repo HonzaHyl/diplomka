@@ -7,3 +7,11 @@ results
 training_run
 ecg_inspection_plots
 /_BCOSified/finetune_run
+finetune_data
+calculate_auc.py
+ecg_plotter.ipynb
+features.csv
+interactive_ecg_plotter.py
+_AFIB_code/afib_hpo_parallel*
+_AFIB_code/mlruns
+_AFIB_code/mlflow.db

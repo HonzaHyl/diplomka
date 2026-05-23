@@ -1,212 +1,210 @@
-from operator import pos
-from helper_code import find_header_files, _load_model, load_header, get_leads, get_frequency, get_labels, load_recording, expand_leads, finetune_model_prep
-import scipy.signal as signal
-from scipy.stats import zscore
-import numpy as np
-import torch
 import os
+import torch
 import yaml
 import sys
 import pickle
-import torch
-import mlflow
 import datetime
+import numpy as np
+import pandas as pd
+import scipy.signal as signal
+from scipy.stats import zscore
+import mlflow
 
+from helper_code import (
+    find_header_files, _load_model, load_header, get_leads, 
+    get_frequency, get_labels, load_recording, expand_leads, 
+    finetune_model_prep
+)
+from model_structure import NN, EnsembleNN
 from device_selector import DeviceSelector
-
-from model_structure import NN
 
 selector = DeviceSelector()
 DEVICE = selector.select(1)[0]
 
-from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import (
+    average_precision_score, roc_auc_score, precision_score, 
+    recall_score, accuracy_score, f1_score, confusion_matrix
+)
 
 MODEL_ID = "finetuned"
+FEATURES_CSV = "/srv/home/jhyl/Afib_recurrence/features.csv"
+WINDOW_SIZE = 4992
+STEP_SIZE   = 2496
 
 def test_model(model_dir, test_data_dir, output_dir):
+    # Load patient rhythm info for context vector r
+    print(f'[{datetime.datetime.now()}] Loading rhythm features...', flush=True)
+    if os.path.exists(FEATURES_CSV):
+        features_df = pd.read_csv(FEATURES_CSV)
+        rhythm_map = dict(zip(features_df['ID'].astype(str), features_df['is_AFIB_before']))
+    else:
+        raise FileNotFoundError(f"Features file not found at {FEATURES_CSV}")
 
     # Load .hea of test data
     print(f'[{datetime.datetime.now()}] Finding header and recording files...', flush=True)
     header_files = find_header_files(test_data_dir)
     print(f'[{datetime.datetime.now()}] Found {len(header_files)} header files.', flush=True)
 
-    # Load model
-    PTH_PATH = os.path.join(model_dir, f"FINAL_MODEL_{MODEL_ID}.pth")
-    PROGRESS_PATH = os.path.join(model_dir, f"PROGRESS_{MODEL_ID}.pickle")
+    # 1. Load model using the new BN-folding pipeline
+    # Note: _load_model now handles folding and remapping automatically.
+    print(f'[{datetime.datetime.now()}] Loading B-cosified model from {model_dir}...', flush=True)
     
-    model = NN(nOUT=26).to(DEVICE)
-    model = finetune_model_prep(model)
-
-    if os.path.exists(PTH_PATH):
-        print(f'[{datetime.datetime.now()}] Loading weights from {PTH_PATH}...', flush=True)
-        model.load_state_dict(torch.load(PTH_PATH, map_location=DEVICE))
-    elif os.path.exists(PROGRESS_PATH):
-        print(f'[{datetime.datetime.now()}] Loading model history from {PROGRESS_PATH}... (This might take a while if the file is large)', flush=True)
-        with open(PROGRESS_PATH, "rb") as handle:
-            models = pickle.load(handle)
-        print(f'[{datetime.datetime.now()}] Pickle loaded successfully.', flush=True)
-        model.load_state_dict(models[-1]["model"]) # Use the last epoch's model
+    # Check if we are loading an ensemble or a single model
+    ensemble_path = os.path.join(model_dir, "ensemble_bcos_model.pth")
+    if os.path.exists(ensemble_path):
+        print(f"[INFO] Detected Ensemble model at {ensemble_path}")
+        checkpoint = torch.load(ensemble_path, map_location=DEVICE)
+        num_models = checkpoint.get('num_models', 4)
+        model = EnsembleNN(nOUT=2, num_models=num_models)
+        for m in model.models:
+            finetune_model_prep(m)
+        model.load_state_dict(checkpoint['model_state_dict'])
     else:
-        raise FileNotFoundError(f"Neither {PTH_PATH} nor {PROGRESS_PATH} found in {model_dir}")
-
+        # Fallback to single model loading (Fold 1 default for testing)
+        loaded_data = _load_model(model_dir, 1, nOUT=2)
+        model = loaded_data["classifier"]
+        model = finetune_model_prep(model)
+        
+    model.to(DEVICE)
     model.eval()
 
     print(f'[{datetime.datetime.now()}] Starting inference loop...', flush=True)
 
     outputs = []
     targets = []
+    softmax_probas = {}
 
-    temp_dict = {"precision":0,
-                 "recall":0,
-                 "confusion_matrix":0,
-                 "f1":0,
-                 "accuracy":0,
-                 "auprc":0,
-                 "auroc":0,
-                 "softmax_probas":{}}
- 
-    # Preprocess recording and run inference
     num_files = len(header_files)
     for i, header_path in enumerate(header_files):
         if i % 10 == 0:
             print(f'[{datetime.datetime.now()}] Processing file {i+1}/{num_files}: {header_path}', flush=True)
-        # Path to recording file
-        recording_path = header_path.replace(".hea", ".mat")
-        filename, extension = os.path.splitext(recording_path)
-        filename = filename.split("/")[-1]
-
-        # Load recording
-        recording = load_recording(recording_path)
         
-        # Get info from header
+        record_id = os.path.basename(header_path).replace(".hea", "")
+        
+        # Load recording and header
+        recording_path = header_path.replace(".hea", ".mat")
+        recording = load_recording(recording_path)
         header = load_header(header_path)
         leads = get_leads(header)
         fs = get_frequency(header)
         label = int(get_labels(header)[0])
 
-        # Expand recording to 12 leads
+        # 1. Preprocess: Resample, Filter, Z-score, 12-lead expansion
+        # (Using logic from preprocess_finetune_data.py)
+        if fs != 500:
+            recording = signal.resample(recording, int(recording.shape[1] * 500 / fs), axis=1)
+        
+        b, a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
+        recording = signal.filtfilt(b, a, recording)
+        
         recording, lead_indicator = expand_leads(recording, leads)
         
-        # B-cosification 6-channel equivalent:
-        lead_indicator = np.concatenate([lead_indicator, lead_indicator], axis=0)
-        
-        lead_indicator = torch.tensor(lead_indicator, dtype=torch.float32).to(DEVICE)
-        lead_indicator = lead_indicator.unsqueeze(0)
-        # Preprocess recording (filters, downsampling, standardization)
-        recording = preprocessing(recording, fs).to(DEVICE)
-        # Infer recordings
-        y = model(recording, lead_indicator)
-        # Gain probabilities
-        p = torch.softmax(y, dim=1)
-        temp_dict["softmax_probas"][filename] = p.tolist()
+        mu = np.nanmean(recording, axis=-1, keepdims=True)
+        std = np.nanstd(recording, axis=-1, keepdims=True) + 1e-8
+        recording = (recording - mu) / std
+        recording = np.nan_to_num(recording).astype(np.float32)
 
+        # 2. Rhythm vector r
+        is_afib = rhythm_map.get(record_id, None)
+        if is_afib is None:
+            print(f"[WARNING] Patient {record_id} not in features.csv. Defaulting to Healthy.")
+            is_afib = 0
+        
+        if is_afib == 1:
+            r_vec = np.array([1, -1], dtype=np.float32)
+        else:
+            r_vec = np.array([-1, 1], dtype=np.float32)
+        
+        r_tensor = torch.from_numpy(r_vec).unsqueeze(0).to(DEVICE)
+        l_tensor = torch.from_numpy(lead_indicator).float().unsqueeze(0).to(DEVICE)
+
+        # 3. Windowed Inference (matches main_code.py validation)
+        seq_len = recording.shape[1]
+        
+        # Pad to multiple of 64
+        remainder = seq_len % 64
+        if remainder != 0:
+            pad_len = 64 - remainder
+            recording = np.pad(recording, ((0, 0), (0, pad_len)), mode='constant')
+            seq_len = recording.shape[1]
+
+        windows = []
+        for start in range(0, seq_len - WINDOW_SIZE + 1, STEP_SIZE):
+            windows.append(recording[:, start : start + WINDOW_SIZE])
+        if len(windows) == 0:
+            windows.append(recording[:, -WINDOW_SIZE:])
+        
+        windows_np = np.stack(windows, axis=0) # [NumWindows, 12, WINDOW_SIZE]
+        
+        # B-cosification (24 channels)
+        pos = np.maximum(windows_np, 0)
+        neg = np.maximum(-windows_np, 0)
+        windows_bcos = np.concatenate([pos, neg], axis=1) # [NumWindows, 24, WINDOW_SIZE]
+        
+        windows_t = torch.from_numpy(windows_bcos).float().unsqueeze(2).to(DEVICE) # [NumWindows, 24, 1, WINDOW_SIZE]
+        
+        l_expanded = l_tensor.expand(windows_t.size(0), -1)
+        r_expanded = r_tensor.expand(windows_t.size(0), -1)
+
+        with torch.no_grad():
+            y = model(windows_t, l_expanded, r_expanded)
+            # Average (AVG) Pooling for patient-level prediction
+            p = torch.softmax(y, dim=1).mean(dim=0, keepdim=True)
+
+        softmax_probas[record_id] = p.tolist()
         outputs.append(p.data.cpu().numpy())
         targets.append(label)
 
-    # Concatenate all batch results into single numpy arrays
-    # targets = np.concatenate(targets, axis=0)
     outputs = np.concatenate(outputs, axis=0)
+    targets = np.array(targets)
 
+    # Evaluation Metrics
+    # Remap for sklearn: internally 0=recurrence, 1=healthy.
+    # Sklearn assumes 1=positive, so flip: 1=recurrence, 0=healthy.
+    targets_sk = 1 - targets
+    pos_probs = outputs[:, 0] # P(recurrence)
+    predictions = (1 - np.argmax(outputs, axis=1))
 
-    positive_class_probs = outputs[:, 1]
+    results = {
+        "auprc": float(average_precision_score(y_true=targets_sk, y_score=pos_probs)),
+        "auroc": float(roc_auc_score(y_true=targets_sk, y_score=pos_probs)),
+        "f1": float(f1_score(y_true=targets_sk, y_pred=predictions)),
+        "precision": float(precision_score(y_true=targets_sk, y_pred=predictions)),
+        "recall": float(recall_score(y_true=targets_sk, y_pred=predictions)),
+        "accuracy": float(accuracy_score(y_true=targets_sk, y_pred=predictions)),
+        "confusion_matrix": confusion_matrix(y_true=targets_sk, y_pred=predictions).tolist(),
+        "softmax_probas": softmax_probas
+    }
 
-    temp_dict["auprc"] = float(average_precision_score(y_true=targets, y_score=positive_class_probs))
-    temp_dict["auroc"] = float(roc_auc_score(y_true=targets, y_score=positive_class_probs))
+    mlflow.log_metrics({k: v for k, v in results.items() if isinstance(v, (int, float))})
 
-    y_pred = (positive_class_probs >= 0.6).astype(int)
-
-    temp_dict["confusion_matrix"] = confusion_matrix(targets, y_pred).tolist()
-
-    temp_dict["f1"] = float(f1_score(targets, y_pred))
-    temp_dict["precision"] = float(precision_score(targets, y_pred))
-    temp_dict["recall"] = float(recall_score(targets, y_pred))
-    temp_dict["accuracy"] = float(accuracy_score(targets, y_pred))
-    mlflow.log_metrics(temp_dict)
-
-    output_file_path = os.path.join(output_dir, "model_"+MODEL_ID+".yaml")
-
+    output_file_path = os.path.join(output_dir, "model_evaluation_results.yaml")
     with open(output_file_path, "w") as f:
-        yaml.dump(temp_dict, f, default_flow_style=None, sort_keys=False)
-        
-
+        yaml.dump(results, f, default_flow_style=None, sort_keys=False)
     
-
-def preprocessing(recording, fs):
-    b,a = signal.butter(3, [1 / 250, 47 / 250], 'bandpass')
-
-    if fs==1000:
-        recording = signal.resample_poly(recording, up=1, down=2, axis=-1) # to 500Hz
-        fs = 500
-    elif fs==500:
-        pass
-    else:
-        recording = signal.resample(recording, int(recording.shape[1] * 500 / fs), axis=1)
-        print(f'RESAMPLING FROM {fs} TO 500')
-        fs = 500
-
-    recording = signal.filtfilt(b, a, recording)
-    recording = zscore(recording, axis=-1)
-    recording = np.nan_to_num(recording)
-
-    # B-cosification 6-channel equivalent:
-    recording = np.concatenate([recording, 1.0 - recording], axis=0)
-
-    # Signal padding
-    maxL = 149952
-    padded_data = np.zeros((recording.shape[0], maxL))
-
-    if recording.shape[1] > maxL:
-        padded_data = recording[:, :maxL].copy()
-    else:
-        padded_data[:, :recording.shape[1]] = recording
-    
-    padded_tensor = torch.tensor(padded_data, dtype=torch.float32)
-    padded_tensor = padded_tensor.unsqueeze(0)
-    padded_tensor = padded_tensor.unsqueeze(2)
-
-    return padded_tensor
+    print(f'[{datetime.datetime.now()}] Evaluation complete. Results saved to {output_file_path}')
 
 if __name__ == '__main__':
-
-    #################### MlFlow Setup ####################
+    # MLflow Setup
     db_url = "sqlite:////mnt/mdpm/d03/jhyl/deepstem_results/mlflow_runs.db"
-    experiment_name = "BCOSified_finetuning"
+    experiment_name = "BCOSified_testing"
     artifact_path = "file:///mnt/mdpm/d03/jhyl/Afib_recurrence/diplomka/results/mlruns"
 
     mlflow.set_tracking_uri(db_url)
-
     try:
         mlflow.create_experiment(experiment_name, artifact_location=artifact_path)
-    except mlflow.exceptions.MlflowException:
-        pass # Experiment already exists
+    except:
+        pass
     mlflow.set_experiment(experiment_name)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"Testing_{timestamp}"
-    run_dir = os.path.join("/srv/home/jhyl/Afib_recurrence/diplomka/results", run_name)
-    os.makedirs(os.path.join(run_dir, "test_outputs"), exist_ok=True)
-    print(f"[INFO] Run directory created: {run_dir}")
     mlflow.start_run(run_name=run_name)
 
-    print(f"[INFO] MLflow tracking URI: {mlflow.get_tracking_uri()}")
-    print(f"[INFO] Experiment ID: {mlflow.get_experiment_by_name(experiment_name).experiment_id}")
+    model_dir = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/_finetune_model/Trial_34/"
+    test_data_dir = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/test_data" # Update if needed
+    output_dir = "/srv/home/jhyl/Afib_recurrence/diplomka/results/test_outputs"
+    os.makedirs(output_dir, exist_ok=True)
 
-    #################### MlFlow Setup ####################
-    USE_ARG = False
-
-    if USE_ARG == True:
-        # Parse arguments.
-        if len(sys.argv) != 4:
-            raise Exception('Include the model, data, and output folders as arguments, e.g., python test_model.py model data outputs.')
-
-        model_directory = sys.argv[1]
-        data_directory = sys.argv[2]
-        output_directory = sys.argv[3]
-    else:
-        model_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/model"
-        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/_BCOSified/finetune_run/test_data"
-        output_directory = os.path.join(run_dir, "test_outputs")
-
-    print('Starting main script...', flush=True)
-    test_model(model_directory, data_directory, output_directory)
-    print('Done.', flush=True)
+    test_model(model_dir, test_data_dir, output_dir)
+    mlflow.end_run()

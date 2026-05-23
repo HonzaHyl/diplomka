@@ -6,8 +6,7 @@ class BcosifiedConv2d(nn.Module):
     def __init__(self, conv2d_module):
         super().__init__()
         self.conv = conv2d_module
-        # Ensure biases are disabled
-        self.conv.bias = None
+        # Biases are kept and utilized in self.conv(x)
         
         self.kernel_size = self.conv.kernel_size
         self.stride = self.conv.stride
@@ -42,7 +41,7 @@ class BcosifiedLinear(nn.Module):
     def __init__(self, linear_module):
         super().__init__()
         self.linear = linear_module
-        self.linear.bias = None
+        # Biases are kept and utilized in self.linear(x)
         
     def forward(self, x):
         # 1. Compute standard linear activation
@@ -63,21 +62,11 @@ class BcosifiedLinear(nn.Module):
 def bcosify_model(model):
     """
     Recursively replaces all Conv2d and Linear layers in the model with their Bcosified equivalents.
-    Also zero-out biases for all modules that have them.
     """
     for name, module in model.named_children():
         if isinstance(module, nn.Conv2d):
-            if hasattr(module, 'bias') and module.bias is not None:
-                module.bias.data.zero_()
-                module.bias = None
             setattr(model, name, BcosifiedConv2d(module))
         elif isinstance(module, nn.Linear):
-            if hasattr(module, 'bias') and module.bias is not None:
-                module.bias.data.zero_()
-                module.bias = None
             setattr(model, name, BcosifiedLinear(module))
         else:
-            if hasattr(module, 'bias') and module.bias is not None:
-                module.bias.data.zero_()
-                module.bias.requires_grad = False
             bcosify_model(module)

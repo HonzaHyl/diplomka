@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import scipy.signal as signal
 from scipy.stats import zscore
+from scipy.ndimage import gaussian_filter1d # <-- NEW IMPORT
 
 from model_structure import EnsembleNN, NN
 from helper_code import load_header, load_recording, expand_leads, get_frequency, get_leads, finetune_model_prep
@@ -99,15 +100,25 @@ def create_interpretability_plot(patient_id, signal_12, attribution_12, output_p
     
     time = np.arange(signal_12.shape[1]) / 500.0 # seconds
     
-    # Normalize attribution for coloring (scale -1 to 1)
-    # We use a robust normalization to avoid single peaks washing out the plot
-    max_attr = np.percentile(np.abs(attribution_12), 99.5) + 1e-8
-    norm_attr = np.clip(attribution_12 / max_attr, -1, 1)
+    # --- NEW BLENDED BLOCK LOGIC ---
+    
+    # 1. Smooth the raw attributions first so nearby spikes form continuous regions
+    # sigma=10 at 500Hz corresponds to a 20ms smoothing window. 
+    # Increase sigma if the blocks are still too fragmented.
+    smoothed_attr = gaussian_filter1d(attribution_12, sigma=10, axis=1)
+    
+    # 2. Normalize the smoothed attributions
+    max_attr = np.percentile(np.abs(smoothed_attr), 99.5) + 1e-8
+    norm_attr = np.clip(smoothed_attr / max_attr, -1, 1)
+    
+    # 3. Hard Threshold into blocks (+1, 0, -1)
+    block_attr = np.zeros_like(norm_attr)
+    block_attr[norm_attr >= 0.8] = 1.0   # Solid Red blocks for >= 0.8
+    block_attr[norm_attr <= -0.8] = -1.0 # Solid Blue blocks for <= -0.8
+    
+    # -------------------------------
     
     for i in range(12):
-        # 1. Background Attribution Heatmap
-        # This creates the "colored sectors" effect
-        # We set the Y range of the heatmap to cover the signal range
         y_min, y_max = np.min(signal_12[i]), np.max(signal_12[i])
         y_padding = (y_max - y_min) * 0.1
         
@@ -115,17 +126,19 @@ def create_interpretability_plot(patient_id, signal_12, attribution_12, output_p
             go.Heatmap(
                 x=time,
                 y=[y_min - y_padding, y_max + y_padding],
-                z=[norm_attr[i]],
-                colorscale='RdBu_r', # Red for positive (Recurrence), Blue for negative (Healthy)
+                z=[block_attr[i]], # <-- USE THE NEW BLOCK ARRAY HERE
+                colorscale='RdBu_r', 
                 zmid=0,
                 showscale=(i == 0),
-                opacity=0.35,
+                opacity=0.45, # Slightly higher opacity for solid blocks looks better
                 name=f"Importance {lead_names[i]}",
                 hoverinfo='skip',
                 colorbar=dict(
                     title="Influence<br>Red: Recurrence<br>Blue: Healthy", 
                     x=1.02, 
-                    thickness=15
+                    thickness=15,
+                    tickvals=[-1, 0, 1], # Force the colorbar to only show the block values
+                    ticktext=['Strong Healthy', 'Neutral', 'Strong Recurrence']
                 ) if i == 0 else None
             ),
             row=i+1, col=1

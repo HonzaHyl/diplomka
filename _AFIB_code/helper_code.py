@@ -145,10 +145,11 @@ class lead_exctractor():
 
     @staticmethod
     def get (x,num_leads,lead_indicator, rng=None):
+        _rng = rng if rng is not None else np.random.default_rng()
+        
         if num_leads==None:
-            # Deterministic random choice: use a seeded numpy RNG when provided.
-            _rng = rng if rng is not None else np.random.default_rng()
-            num_leads = int(_rng.choice([12, 8, 6, 4, 3, 2]))
+            # Randomly pick one of the standard configurations
+            num_leads = _rng.choice([2, 3, 4, 6, 8, 12])
 
         if num_leads==12:
             # Twelve leads: I, II, III, aVR, aVL, aVF, V1, V2, V3, V4, V5, V6
@@ -232,7 +233,7 @@ def _load_model(model_directory,id, nOUT):
     return model
 
 
-def finetune_model_prep(model, config=None):
+def finetune_model_prep(model, config=None, use_rhythm=True):
     # Unfreeze all layers for full architecture finetuning
     for param in model.parameters():
         param.requires_grad = True
@@ -242,6 +243,9 @@ def finetune_model_prep(model, config=None):
         in_features = model.head[0].in_features
     else:
         in_features = model.head.in_features
+        
+    if use_rhythm:
+        in_features += 2
 
     # Force the head to be a simple linear layer
     model.head = nn.Linear(in_features, 2)

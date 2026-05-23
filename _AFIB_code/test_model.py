@@ -10,6 +10,7 @@ import sys
 import pickle
 import torch
 import mlflow
+import pandas as pd
 import datetime
 
 from device_selector import DeviceSelector
@@ -21,7 +22,8 @@ DEVICE = selector.select(1)[0]
 
 from sklearn.metrics import average_precision_score, roc_auc_score, precision_score, recall_score, accuracy_score, f1_score, confusion_matrix, balanced_accuracy_score
 
-MODEL_ID = "finetuned"
+DISABLE_AFIB_BEFORE = True  # Set to True to turn off is_AFIB_before flag (forces it to 0 for all)
+MODEL_ID = "finetuned_no_afib_before" if DISABLE_AFIB_BEFORE else "finetuned"
 
 def test_model(model_path, test_data_dir, output_dir):
 
@@ -45,17 +47,18 @@ def test_model(model_path, test_data_dir, output_dir):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
 
+
     outputs = []
     targets = []
 
-    temp_dict = {"precision":0,
-                 "recall":0,
-                 "confusion_matrix":0,
-                 "f1":0,
-                 "accuracy":0,
-                 "auprc":0,
-                 "auroc":0,
-                 "softmax_probas":{}}
+    temp_dict = {"softmax_probas": {}}
+    
+    features_csv_path = '/srv/home/jhyl/Afib_recurrence/features.csv'
+    if os.path.exists(features_csv_path):
+        features_df = pd.read_csv(features_csv_path)
+        rhythm_map = dict(zip(features_df['ID'].astype(str), features_df['is_AFIB_before']))
+    else:
+        rhythm_map = {}
  
     # Preprocess recording and run inference
     for header_path in header_files:
@@ -120,16 +123,28 @@ def test_model(model_path, test_data_dir, output_dir):
         
         lead_indicator_expanded = lead_indicator.expand(windows_tensor.shape[0], -1).to(DEVICE)
         
+        if DISABLE_AFIB_BEFORE:
+            rhythm = 0
+        else:
+            rhythm = rhythm_map.get(filename, 0)
+
+        if rhythm == 1:
+            rhythm_vec = [1, -1]
+        else:
+            rhythm_vec = [-1, 1]
+        r_tensor = torch.tensor([rhythm_vec], dtype=torch.float32).to(DEVICE)
+        r_expanded = r_tensor.expand(windows_tensor.shape[0], -1)
+        
         with torch.no_grad():
-            y = model(windows_tensor, lead_indicator_expanded)
+            y = model(windows_tensor, lead_indicator_expanded, r_expanded)
             p = torch.softmax(y, dim=1)
         
         # Patient-level prediction (Mean across windows)
-        # The model was trained with Healthy = 1, Recurrence = 0.
-        # So p[:, 1] is the probability of Healthy (the positive class).
-        prob_recurrence = p[:, 0].mean().item()
-        prob_healthy = p[:, 1].mean().item()
-        patient_p = np.array([[prob_recurrence, prob_healthy]])
+        # The model was trained with Recurrence = 1, Healthy = 0.
+        # So p[:, 1] is the probability of Recurrence (the positive class).
+        prob_healthy = p[:, 0].mean().item()
+        prob_recurrence = p[:, 1].mean().item()
+        patient_p = np.array([[prob_healthy, prob_recurrence]])
         
         temp_dict["softmax_probas"][filename] = {
             "probabilities": patient_p.tolist()[0],
@@ -148,21 +163,24 @@ def test_model(model_path, test_data_dir, output_dir):
     targets_np = np.array(targets)
 
     # AUPRC is highly sensitive to class imbalance. 
-    # We calculate it for both the Healthy class (1) and Recurrence class (0).
-    temp_dict["auprc_healthy"] = float(average_precision_score(y_true=targets_np, y_score=outputs[:, 1]))
-    temp_dict["auprc_recurrence"] = float(average_precision_score(y_true=1-targets_np, y_score=outputs[:, 0]))
+    # We calculate it for both the Recurrence class (1) and Healthy class (0).
+    temp_dict["auprc"] = temp_dict["auprc_recurrence"] = float(average_precision_score(y_true=targets_np, y_score=outputs[:, 1]))
+    temp_dict["auprc_healthy"] = float(average_precision_score(y_true=1-targets_np, y_score=outputs[:, 0]))
     
     # AUROC is symmetric, so one is enough
     temp_dict["auroc"] = float(roc_auc_score(y_true=targets_np, y_score=positive_class_probs))
 
-    y_pred = (positive_class_probs >= 0.5).astype(int)
+    threshold = 0.51
+    y_pred = (positive_class_probs >= threshold).astype(int)
 
+    temp_dict["disable_afib_before"] = DISABLE_AFIB_BEFORE
+    temp_dict["threshold"] = threshold
     temp_dict["confusion_matrix"] = confusion_matrix(targets_np, y_pred).tolist()
 
     # Macro averages treat both classes equally, preventing the majority class from dominating the score.
-    temp_dict["f1_macro"] = float(f1_score(targets_np, y_pred, average="macro"))
-    temp_dict["precision_macro"] = float(precision_score(targets_np, y_pred, average="macro", zero_division=0))
-    temp_dict["recall_macro"] = float(recall_score(targets_np, y_pred, average="macro"))
+    temp_dict["precision"] = temp_dict["precision_macro"] = float(precision_score(targets_np, y_pred, average="macro", zero_division=0))
+    temp_dict["recall"] = temp_dict["recall_macro"] = float(recall_score(targets_np, y_pred, average="macro"))
+    temp_dict["f1"] = temp_dict["f1_macro"] = float(f1_score(targets_np, y_pred, average="macro"))
     
     temp_dict["accuracy"] = float(accuracy_score(targets_np, y_pred))
     temp_dict["balanced_accuracy"] = float(balanced_accuracy_score(targets_np, y_pred))
@@ -235,8 +253,8 @@ if __name__ == '__main__':
         data_directory = sys.argv[2]
         output_directory = sys.argv[3]
     else:
-        model_path = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Trial_45/ensemble_model.pth"
-        data_directory = "/srv/home/jhyl/Afib_recurrence/diplomka/finetune_data/SR_before/test"
+        model_path = "/srv/home/jhyl/Afib_recurrence/diplomka/results/Trial_42_2.5.1/epoch_5/ensemble_model_5.pth"
+        data_directory = "/srv/home/jhyl/Afib_recurrence/finetune_data_all/test"
         output_directory = os.path.join(run_dir, "test_outputs")
 
     print('Starting main script...', flush=True)

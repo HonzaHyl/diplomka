@@ -8,17 +8,19 @@ from main_code import training_code_kfold, CONFIG
 from device_selector import DeviceSelector
 
 # --- HPO CONFIGURATION ---
-DATA_DIR = "/srv/home/jhyl/Afib_recurrence/diplomka/finetune_data/SR_before/train"
+DATA_DIR = "/srv/home/jhyl/Afib_recurrence/finetune_data_all/train"
 MODEL_DIR = "/srv/home/jhyl/Afib_recurrence/diplomka/results/hpo_runs"
-N_TOTAL_TRIALS = 50
+N_TOTAL_TRIALS = 150
 K_FOLDS = 4
 N_GPUS = 3
 # -------------------------
 
 def objective(trial, device):
-    head_lr = trial.suggest_float("head_lr", 1e-5, 5e-3, log=True)
+    head_lr = trial.suggest_float("head_lr", 1e-6, 1e-3, log=True)
     decay_factor = trial.suggest_float("layer_decay", 0.1, 0.5)
-    weight_decay = trial.suggest_float("weight_decay", 1e-4, 1e-1, log=True)
+    backbone_wd = trial.suggest_float("backbone_weight_decay", 1e-4, 1e-1, log=True)
+    head_wd = trial.suggest_float("head_weight_decay", 1e-4, 1e-1, log=True)
+    dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.7)
     
     rb_4_lr = head_lr * decay_factor
     rb_3_lr = head_lr * (decay_factor ** 2)
@@ -26,15 +28,16 @@ def objective(trial, device):
     
     trial_config = CONFIG.copy()
     trial_config.update({
+        "dropout_rate": dropout_rate,
         "layer_tuning": {
             "conv": {"trainable": False, "lr": 0, "weight_decay": 0},
             "bn":   {"trainable": False, "lr": 0, "weight_decay": 0},
-            "rb_0": {"trainable": True, "lr": early_rb_lr, "weight_decay": weight_decay},
-            "rb_1": {"trainable": True, "lr": early_rb_lr, "weight_decay": weight_decay},
-            "rb_2": {"trainable": True, "lr": early_rb_lr, "weight_decay": weight_decay},
-            "rb_3": {"trainable": True, "lr": rb_3_lr,     "weight_decay": weight_decay},
-            "rb_4": {"trainable": True, "lr": rb_4_lr,     "weight_decay": weight_decay},
-            "head": {"trainable": True, "lr": head_lr,     "weight_decay": weight_decay * 10}
+            "rb_0": {"trainable": True, "lr": early_rb_lr, "weight_decay": backbone_wd},
+            "rb_1": {"trainable": True, "lr": early_rb_lr, "weight_decay": backbone_wd},
+            "rb_2": {"trainable": True, "lr": early_rb_lr, "weight_decay": backbone_wd},
+            "rb_3": {"trainable": True, "lr": rb_3_lr,     "weight_decay": backbone_wd},
+            "rb_4": {"trainable": True, "lr": rb_4_lr,     "weight_decay": backbone_wd},
+            "head": {"trainable": True, "lr": head_lr,     "weight_decay": head_wd}
         }
     })
     
@@ -62,22 +65,15 @@ def objective(trial, device):
             mlflow.log_metric("mean_auroc", mean_auroc)
             mlflow.log_metric("std_auroc",  std_auroc)
             
-            # Risk-adjusted objective: reward high mean AUROC but penalise
-            # cross-fold variance. The 0.5 weight means Optuna will trade
-            # 1 unit of std for 0.5 units of mean — consistent trials are
-            # preferred but a single unlucky fold won't sink a good trial.
-            # Structural instability (bad hyperparams) is already handled by
-            # the ratio-based TrialPruned check inside _training_code.
-            score = mean_auroc - 0.5 * std_auroc
-            mlflow.log_metric("objective_score", score)
-            return score
+            # We now return both metrics to let Optuna find the Pareto front.
+            return mean_auroc, std_auroc
             
         except optuna.TrialPruned:
             print(f"Trial {trial.number} was pruned.")
             raise 
         except Exception as e:
             print(f"Trial {trial.number} on {device} failed: {e}")
-            return 0.0
+            return 0.0, 1.0
 
 def run_optimize(device, study_name, storage_name, n_trials):
     study = optuna.load_study(study_name=study_name, storage=storage_name)
@@ -87,16 +83,13 @@ if __name__ == "__main__":
     os.makedirs(MODEL_DIR, exist_ok=True)
     mlflow.set_experiment("AFib_Recurrence_HPO_Parallel")
     
-    study_name = "afib_hpo_parallel_2.4"
+    study_name = "afib_hpo_parallel_2.5.1"
     storage_name = f"sqlite:///{study_name}.db"
     
-    # Single-objective: maximise mean valid AUROC.
-    # Structural instability is handled by ratio-based TrialPruned inside _training_code,
-    # so we no longer need to co-optimise the gap as a second objective.
     study = optuna.create_study(
         study_name=study_name,
         storage=storage_name,
-        direction="maximize",
+        directions=["maximize", "minimize"],
         load_if_exists=True,
     )
     
@@ -131,9 +124,12 @@ if __name__ == "__main__":
     
     print("\n" + "="*30)
     print("PARALLEL HPO COMPLETE")
-    print(f"Best Trial: #{study.best_trial.number}")
-    print(f"  Mean Valid AUROC: {study.best_trial.value:.4f}")
-    print(f"  Params: {study.best_trial.params}")
+    print(f"Best Trials (Pareto Front):")
+    for best_trial in study.best_trials:
+        print(f"  Trial #{best_trial.number}")
+        print(f"    Mean Valid AUROC: {best_trial.values[0]:.4f}")
+        print(f"    Std Valid AUROC:  {best_trial.values[1]:.4f}")
+        print(f"    Params: {best_trial.params}")
     
     # --- VISUALIZATION EXPORT ---
     print("\nExporting visualizations...")

@@ -192,6 +192,13 @@ class CustomDataset(Dataset):
         self.step_size = step
         self.num_leads = 12 
 
+        features_csv_path = '/srv/home/jhyl/Afib_recurrence/features.csv'
+        if os.path.exists(features_csv_path):
+            features_df = pd.read_csv(features_csv_path)
+            self.rhythm_map = dict(zip(features_df['ID'].astype(str), features_df['is_AFIB_before']))
+        else:
+            self.rhythm_map = {}  # No rhythm info — feature removed from model
+
         for path in header_paths:
             temp_dict = dict()
             temp_dict["header"] = path
@@ -199,6 +206,14 @@ class CustomDataset(Dataset):
             # Record is now the .npy file
             npy_path = path.replace(".hea", ".npy")
             temp_dict["npy_path"] = npy_path
+
+            filename = os.path.basename(path).replace(".hea", "")
+            rhythm = self.rhythm_map.get(filename, 0)
+            if rhythm == 1:
+                rhythm_vec = [1, -1]
+            else:
+                rhythm_vec = [-1, 1]
+            temp_dict['rhythm'] = rhythm_vec
 
             # Load target from header
             header = load_header(path)
@@ -331,7 +346,7 @@ class CustomDataset(Dataset):
                 start_idx = np.random.randint(0, self.window_size - cutout_len)
                 window[:, start_idx : start_idx + cutout_len] = 0.0
 
-            return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
+            return torch.from_numpy(window).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float(), torch.tensor(row['rhythm']).float()
         else:
             # --- VALIDATION: Full length signal — NO augmentation ---
             row = self.files_df.iloc[index]
@@ -347,7 +362,7 @@ class CustomDataset(Dataset):
             lead_indicator = np.ones(12)
             data, lead_indicator = lead_exctractor.get(data, self.num_leads, lead_indicator)
 
-            return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float()
+            return torch.from_numpy(data).float(), torch.from_numpy(row['target']).float(), torch.from_numpy(lead_indicator).float(), torch.tensor(row['rhythm']).float()
         
 
 def training_code(data_directory, model_directory, resume_checkpoint=None, config=None, device=None):
@@ -374,6 +389,13 @@ def training_code_kfold(data_directory, model_directory, k_folds=4, resume_check
             # Pass the pre-split datasets instead of data_directory
             best_auroc, train_at_best = _training_code((train_ds, valid_ds), fold_model_dir, f"fold_{fold_idx+1}", resume_checkpoint, config=config, device=device, trial=trial, fold_idx=fold_idx)
             fold_aurocs.append((best_auroc, train_at_best))
+            
+            # ── FOLD-LEVEL PRUNING ──
+            if trial is not None and fold_idx == 0:
+                if best_auroc < 0.55:
+                    print(f"\n[TRIAL PRUNED] Fold 1 AUROC ({best_auroc:.4f}) is below baseline 0.55.")
+                    mlflow.set_tag("pruned_reason", "fold_0_baseline")
+                    raise optuna.exceptions.TrialPruned()
     
     return fold_aurocs
 
@@ -467,6 +489,7 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
 
     loaded_model = _load_model(".", 1, nOUT=26)
     classifier = loaded_model["classifier"]
+    classifier.dropout_rate = config.get("dropout_rate", 0.5)
     prep_m = finetune_model_prep(classifier, config=config)
     model = prep_m.to(device)
     
@@ -631,10 +654,17 @@ def _training_code(data_directory_or_datasets, model_directory, ensamble_ID, res
             scheduler.step(valid_loss)
 
         # CHECK: Has patience run out? (fold early stop — not a trial prune)
+        # CHECK: Has patience run out? (fold early stop — not a trial prune)
         if patience_counter >= patience:
             print(f"FOLD EARLY STOPPED: Validation loss has not improved for {patience} epochs. "
                   f"(Remaining folds will still run.)")
             break
+            
+        # ── EPOCH-BASELINE PRUNING ──
+        if trial is not None and epoch == warmup_epochs + 3 and valid_auroc < 0.55:
+            print(f"\n[TRIAL PRUNED] Epoch {epoch} AUROC ({valid_auroc:.4f}) is below baseline 0.55 (post-warmup).")
+            mlflow.set_tag("pruned_reason", f"epoch_{epoch}_baseline")
+            raise optuna.exceptions.TrialPruned()
 
         
     writer.close()
@@ -677,14 +707,15 @@ def train_part(model, dataset, opt, loss_fn, device, scheduler=None):
             if hasattr(m, 'weight') and m.weight is not None and not m.weight.requires_grad:
                 m.eval()
 
-    for (x, t, l) in dataset:
+    for (x, t, l, r) in dataset:
         opt.zero_grad()
 
         x = x.unsqueeze(2).float().to(device)
         t = t.to(device)
         l = l.float().to(device)
+        r = r.float().to(device)
 
-        y = model(x, l)
+        y = model(x, l, r)
         t_indices = torch.argmax(t, dim=1)
         J = loss_fn(input=y, target=t_indices)
 
@@ -696,11 +727,11 @@ def train_part(model, dataset, opt, loss_fn, device, scheduler=None):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
         opt.step()
         
-        # Update torchmetrics: remap so that 1 = recurrence (positive class)
+        # Update torchmetrics: labels are already 1 = recurrence (positive class)
         with torch.no_grad():
             p = torch.softmax(y, dim=1)
-            pos_probs   = p[:, 0]                  # P(recurrence): higher = more likely recurrence
-            targets_sk  = 1 - t_indices            # 0→1 (recurrence), 1→0 (healthy)
+            pos_probs   = p[:, 1]                  # P(recurrence): higher = more likely recurrence
+            targets_sk  = t_indices                # 1 (recurrence), 0 (healthy)
 
             metric_auroc.update(pos_probs, targets_sk)
             metric_auprc.update(pos_probs, targets_sk)
@@ -732,7 +763,7 @@ def valid_part(model, dataset, loss_fn, device): # <-- Added loss_fn
     model.eval() 
 
     with torch.no_grad():  
-        for (x, t, l) in dataset:
+        for (x, t, l, r) in dataset:
             sig_len = x.shape[-1]
             window_size = WINDOW_SIZE
             step_size = STEP_SIZE
@@ -755,23 +786,24 @@ def valid_part(model, dataset, loss_fn, device): # <-- Added loss_fn
             l = l.float().to(device)
             l_expanded = l.expand(windows_tensor.shape[0], -1)
             
+            r = r.float().to(device)
+            r_expanded = r.expand(windows_tensor.shape[0], -1)
+            
             # Get raw logits for all windows: [num_windows, 2]
-            y = model(windows_tensor, l_expanded)
+            y = model(windows_tensor, l_expanded, r_expanded)
             
-            # Convert each window's logits to probabilities FIRST
-            window_probs = torch.softmax(y, dim=1)
+            # Patient-level prediction: Softmax each window, then AVERAGE probabilities.
+            # This implements a "voting" mechanism where multiple windows must 
+            # show AFib for the patient-level score to be high.
+            window_probs = torch.softmax(y, dim=1) # [num_windows, 2]
+            patient_p = window_probs.mean(dim=0, keepdim=True) # [1, 2]
             
-            # Patient-level prediction: Global Average Pooling on probabilities
-            # This ensures that structural changes are consistent across the entire recording
-            # and prevents a few highly-confident noise artifacts from dominating the prediction.
-            patient_p = window_probs.mean(dim=0, keepdim=True)      # [1, 2]
-            
-            # True validation loss: FocalLoss expects logits. We can safely pass log(p)
-            # because FocalLoss internally applies log_softmax, and log_softmax(log(p)) = log(p).
-            pseudo_logits = torch.log(patient_p + 1e-8)
+            # True validation loss: CrossEntropyLoss expects logits, so we pass log(probabilities).
+            # log_softmax(log(p)) == log(p) when sum(p) == 1.
+            avg_logits = torch.log(patient_p + 1e-8)
             
             t_indices = torch.argmax(t, dim=1)
-            batch_loss = loss_fn(input=pseudo_logits, target=t_indices)
+            batch_loss = loss_fn(input=avg_logits, target=t_indices)
             total_loss += batch_loss.item()
             num_batches += 1
 
@@ -781,11 +813,10 @@ def valid_part(model, dataset, loss_fn, device): # <-- Added loss_fn
     targets = np.concatenate(targets, axis=0)
     outputs = np.concatenate(outputs, axis=0)
     
-    # Remap for sklearn: internally 0=recurrence, 1=healthy.
-    # Sklearn assumes 1=positive, so flip: 1=recurrence, 0=healthy.
-    targets_sk  = 1 - targets                       # 0→1 (recurrence), 1→0 (healthy)
-    pos_probs   = outputs[:, 0]                     # P(recurrence): higher = more likely recurrence
-    predictions = (1 - np.argmax(outputs, axis=1))  # argmax 0→pred 1 (recurrence), 1→pred 0 (healthy)
+    # Labels are already 1=recurrence, 0=healthy
+    targets_sk  = targets                           # 1 (recurrence), 0 (healthy)
+    pos_probs   = outputs[:, 1]                     # P(recurrence): higher = more likely recurrence
+    predictions = np.argmax(outputs, axis=1)        # argmax 1→pred 1 (recurrence), 0→pred 0 (healthy)
     best_threshold = 0.5
     
     auprc = average_precision_score(y_true=targets_sk, y_score=pos_probs)
@@ -800,11 +831,9 @@ def valid_part(model, dataset, loss_fn, device): # <-- Added loss_fn
 
 
 def collate_fn(batch):
-    # batch: list of tuples (x, t, l)
-    
-    # Stack inputs along batch dimension
+    # batch: list of tuples (x, t, l, r)
     X = torch.stack([b[0] for b in batch], dim=0)
     t = torch.stack([b[1] for b in batch], dim=0)
     l = torch.stack([b[2] for b in batch], dim=0)
-    
-    return X, t, l
+    r = torch.stack([b[3] for b in batch], dim=0)
+    return X, t, l, r

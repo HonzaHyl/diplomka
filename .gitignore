@@ -15,3 +15,7 @@ interactive_ecg_plotter.py
 _AFIB_code/afib_hpo_parallel*
 _AFIB_code/mlruns
 _AFIB_code/mlflow.db
+/_BCOSified/_finetune_model/mlruns/
+/_BCOSified/_finetune_model/bcos_finetune_hpo_v1.0.db
+_AFIB_code/analyze_afib.py
+.vscode

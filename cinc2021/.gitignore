@@ -1,0 +1,15 @@
+docker_test/
+.idea/
+
+output/
+output_2/
+output_3/
+output_6/
+output_12/
+
+
+
+__pycache__/
+
+
+.DS_Store

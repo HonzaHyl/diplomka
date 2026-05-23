@@ -1,0 +1,19 @@
+image: docker:stable
+
+services:
+  - docker:dind
+
+stages:
+  - build
+
+build:
+  stage: build
+  only:
+    refs:
+      - master
+  script:
+    - docker_test/run_docker.sh
+  artifacts:
+    name: "test_outputs"
+    paths:
+      - docker_test/test_outputs

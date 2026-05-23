@@ -4,13 +4,13 @@ import torch
 import optuna
 from model_structure import EnsembleNN
 """
-python3 create_ensemble.py --study_name afib_hpo_parallel_2.4 --db_path afib_hpo_parallel_2.4.db --trial_number 45
+python3 create_ensemble.py --study_name afib_hpo_parallel_2.5.1 --db_path afib_hpo_parallel_2.5.1.db --trial_number 42 --target_epoch 5
 
 """
 
-def create_ensemble(trial_dir, output_path, device):
+def create_ensemble(trial_dir, output_path, device, target_epoch=None):
     """
-    Loads the 4 best weights from the 4 folds of a cross-validation trial
+    Loads weights from the folds of a cross-validation trial
     and saves them as a single EnsembleNN model.
     """
     print(f"Scanning trial directory: {trial_dir}")
@@ -24,26 +24,52 @@ def create_ensemble(trial_dir, output_path, device):
         
     print(f"Found {len(folds)} folds: {folds}")
     
-    # Initialize the ensemble model
-    ensemble = EnsembleNN(nOUT=2, num_models=len(folds)).to(device)
+    all_weight_paths = []
     
-    for i, fold in enumerate(folds):
-        fold_dir = os.path.join(trial_dir, fold)
-        
-        # Prefer best_loss_weights.pth as the end model
-        weight_path = os.path.join(fold_dir, "best_loss_weights.pth")
-        
-        if not os.path.exists(weight_path):
-            print(f"  best_loss_weights.pth not found in {fold}, looking for latest checkpoint...")
+    if target_epoch is not None:
+        print(f"Collecting checkpoints for epoch {target_epoch}...")
+        for fold in folds:
+            fold_dir = os.path.join(trial_dir, fold)
             checkpoints = [f for f in os.listdir(fold_dir) if f.startswith("checkpoint_epoch")]
-            if checkpoints:
-                # Sort by epoch number to get the latest
-                checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                weight_path = os.path.join(fold_dir, checkpoints[-1])
-            else:
-                raise FileNotFoundError(f"No valid weights or checkpoints found in {fold_dir}")
-                
-        print(f"  Loading fold {i+1} from {weight_path}")
+            for ckpt in checkpoints:
+                try:
+                    epoch = int(ckpt.split('_')[-1].split('.')[0])
+                    if epoch == target_epoch:
+                        all_weight_paths.append(os.path.join(fold_dir, ckpt))
+                except ValueError:
+                    continue # Skip if it doesn't match expected format
+        if not all_weight_paths:
+            raise FileNotFoundError(f"No checkpoints found for epoch {target_epoch}.")
+        
+        # Sort paths to be deterministic
+        all_weight_paths.sort()
+    else:
+        for i, fold in enumerate(folds):
+            fold_dir = os.path.join(trial_dir, fold)
+            
+            # Prefer best_loss_weights.pth as the end model
+            weight_path = os.path.join(fold_dir, "best_loss_weights.pth")
+            
+            if not os.path.exists(weight_path):
+                print(f"  best_loss_weights.pth not found in {fold}, looking for latest checkpoint...")
+                checkpoints = [f for f in os.listdir(fold_dir) if f.startswith("checkpoint_epoch")]
+                if checkpoints:
+                    # Sort by epoch number to get the latest
+                    checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
+                    weight_path = os.path.join(fold_dir, checkpoints[-1])
+                else:
+                    raise FileNotFoundError(f"No valid weights or checkpoints found in {fold_dir}")
+                    
+            all_weight_paths.append(weight_path)
+            
+    num_models = len(all_weight_paths)
+    print(f"Total models to include in ensemble: {num_models}")
+            
+    # Initialize the ensemble model
+    ensemble = EnsembleNN(nOUT=2, num_models=num_models).to(device)
+    
+    for i, weight_path in enumerate(all_weight_paths):
+        print(f"  Loading model {i+1}/{num_models} from {weight_path}")
         checkpoint = torch.load(weight_path, map_location=device)
         state_dict = checkpoint.get('model_state_dict', checkpoint)
         
@@ -58,13 +84,13 @@ def create_ensemble(trial_dir, output_path, device):
     # Save the whole ensemble state dict so it can be loaded with ensemble.load_state_dict()
     torch.save({
         'model_state_dict': ensemble.state_dict(),
-        'num_models': len(folds),
+        'num_models': num_models,
         'is_ensemble': True
     }, output_path)
     
     print("Done!")
     print(f"\nTo use this model in testing:")
-    print(f"  1. Initialize: model = EnsembleNN(nOUT=2, num_models={len(folds)})")
+    print(f"  1. Initialize: model = EnsembleNN(nOUT=2, num_models={num_models})")
     print(f"  2. Load weights: model.load_state_dict(torch.load('{output_path}')['model_state_dict'])")
 
 if __name__ == "__main__":
@@ -75,6 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--trial_number", type=int, help="Specific trial number to use from the DB (optional, defaults to best trial).")
     parser.add_argument("--model_dir", type=str, default="/srv/home/jhyl/Afib_recurrence/diplomka/results/hpo_runs", help="Base directory where Optuna trials are saved.")
     parser.add_argument("--output_file", type=str, default="/srv/home/jhyl/Afib_recurrence/diplomka/results/ensemble_model.pth", help="Output path for the ensemble .pth file.")
+    parser.add_argument("--target_epoch", type=int, default=None, help="Epoch number to create the ensemble from. If provided, models from this specific epoch across all folds will be used.")
     
     args = parser.parse_args()
     
@@ -100,4 +127,4 @@ if __name__ == "__main__":
     # Use CPU to just load and re-save the weights to avoid GPU memory overhead
     device = torch.device('cpu')
     
-    create_ensemble(trial_dir, args.output_file, device)
+    create_ensemble(trial_dir, args.output_file, device, target_epoch=args.target_epoch)

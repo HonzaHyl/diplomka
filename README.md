@@ -9,7 +9,7 @@ This repository contains tools, preprocessing pipelines, and model architectures
 ### 1. `model_utils/`
 Utility scripts for model management, extraction, and learning curve analysis.
 
-* **[extract_fold_checkpoints.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/model_utils/extract_fold_checkpoints.py)**: Extracts and copies model checkpoints for each fold of a cross-validation run from MLflow artifacts based on the best trial in an Optuna database.
+* **[extract_fold_checkpoints.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/model_utils/extract_fold_checkpoints.py)**: Extracts and copies model checkpoints for each fold of a cross-validation run from MLflow artifacts based on the best/selected trial in an Optuna database.
 * **[plot_cv_metrics.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/model_utils/plot_cv_metrics.py)**: Fetches train/validation loss and AUROC metrics from MLflow runs and plots cross-validation learning curves with mean and standard deviation.
 
 ---
@@ -43,3 +43,7 @@ The core modeling pipeline containing model architectures, training routines, hy
 * **[test_script.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/_AFIB_code/test_script.py)**: A simple scratch script to verify the loading of a pickled model classifier onto the CPU/GPU device using PyTorch's `load_state_dict` in non-strict mode.
 * **[train_model.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/_AFIB_code/train_model.py)**: Script to start a standard (single-fold) model training run using a given data directory, setting up directory paths, and logging progress/checkpoints to MLflow and Tensorboard.
 * **[train_model_kfold.py](file:///srv/home/jhyl/Afib_recurrence/diplomka/_AFIB_code/train_model_kfold.py)**: Script to start a 4-fold cross-validation model training run using a given data directory, tracking progress on a per-fold basis via MLflow.
+
+### 4. CINC2021 Code
+
+The original code for the CINC2021 challenge, minimally modified to pretrain the original model on the data from the challenge's training set.

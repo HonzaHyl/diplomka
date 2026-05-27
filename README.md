@@ -4,6 +4,10 @@ This repository contains tools, preprocessing pipelines, and model architectures
 
 ---
 
+## Data
+* Data for pre-training of the model can be found on the website https://moody-challenge.physionet.org/2021
+* Data for fine-tuning of the model are not publicaly available due to their clinical origin
+
 ## Directory & Script Directory Overview
 
 ### 1. `model_utils/`

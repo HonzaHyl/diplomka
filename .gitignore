@@ -19,3 +19,4 @@ _AFIB_code/mlflow.db
 /_BCOSified/_finetune_model/bcos_finetune_hpo_v1.0.db
 _AFIB_code/analyze_afib.py
 .vscode
+Trial_42
